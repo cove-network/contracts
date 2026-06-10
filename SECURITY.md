@@ -90,10 +90,9 @@ findings (e.g., fund drain, supply manipulation) get materially
 larger rewards than low-impact findings (e.g., griefing without fund
 risk).
 
-A formal Immunefi program is planned pre-mainnet, where terms will be
-standardized and published publicly. Until then, treat anything here
-as a good-faith arrangement between us and you, settled when funds
-allow.
+Treat this as a good-faith arrangement between us and you, settled
+when funds allow. If we later formalize a public bounty program, the
+standardized terms will be announced here and on Discord.
 
 ## Hall of fame
 
