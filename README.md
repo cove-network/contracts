@@ -84,7 +84,7 @@ Mainnet deployment will be added here when it ships.
 ## Security posture
 
 We're a small team shipping pre-mainnet, so the security story is
-honest and layered rather than dependent on a single named-firm audit:
+honest, layered, and verifiable by anyone:
 
 ### What we've done
 
@@ -108,9 +108,6 @@ honest and layered rather than dependent on a single named-firm audit:
 
 ### What we haven't done (yet)
 
-- **Third-party paid audit**: Resource-constrained pre-mainnet. We
-  intend to fund a formal audit once protocol revenue begins. In the
-  meantime, the code is public for review.
 - **Formal verification**: Out of scope for this version.
 
 ### Bug bounty
