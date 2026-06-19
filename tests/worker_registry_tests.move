@@ -1,6 +1,7 @@
 #[test_only]
 module cove::worker_registry_tests {
     use sui::test_scenario::{Self as ts, Scenario};
+    use sui::clock;
     use cove::worker_registry::{Self, WorkerRegistry, Worker};
     use cove::admin_registry::{Self, AdminRegistry};
 
@@ -9,6 +10,10 @@ module cove::worker_registry_tests {
     const ADMIN: address = @0xAD;
     const WORKER1: address = @0x1;
     const WORKER2: address = @0x2;
+    /// The orchestrator's least-privilege role -- not an admin.
+    const ORCHESTRATOR: address = @0x0B;
+    /// A wallet with no admin or orchestrator privileges at all.
+    const STRANGER: address = @0xBAD;
 
     // ============================= Node IDs =================================
 
@@ -1374,6 +1379,58 @@ module cove::worker_registry_tests {
             let _id = worker_registry::get_worker_id(&registry, WORKER1, node_a());
             ts::return_shared(registry);
         };
+
+        ts::end(scenario);
+    }
+
+    // -----------------------------------------------------------------
+    // Orchestrator role: the orchestrator registers workers as a least-
+    // privilege ORCHESTRATOR, not as an admin.
+    // -----------------------------------------------------------------
+
+    /// The super admin promotes ORCHESTRATOR into the orchestrator set.
+    fun grant_orchestrator(scenario: &mut Scenario, who: address) {
+        ts::next_tx(scenario, ADMIN);
+        {
+            let mut admin_reg = ts::take_shared<AdminRegistry>(scenario);
+            let mut clk = clock::create_for_testing(ts::ctx(scenario));
+            clock::set_for_testing(&mut clk, 1000);
+            admin_registry::add_orchestrator(&mut admin_reg, who, &clk, ts::ctx(scenario));
+            clock::destroy_for_testing(clk);
+            ts::return_shared(admin_reg);
+        };
+    }
+
+    #[test]
+    fun test_orchestrator_can_register_worker() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        grant_orchestrator(&mut scenario, ORCHESTRATOR);
+
+        // ORCHESTRATOR (not an admin) registers WORKER1 -- the orchestrator's path.
+        ts::next_tx(&mut scenario, ORCHESTRATOR);
+        register_node(&mut scenario, WORKER1, node_a());
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let registry = ts::take_shared<WorkerRegistry>(&scenario);
+            assert!(worker_registry::is_registered(&registry, WORKER1), 0);
+            assert!(worker_registry::is_node_registered(&registry, WORKER1, node_a()), 1);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = worker_registry::ENotAdmin)]
+    fun test_stranger_cannot_register_worker() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+
+        // STRANGER is neither admin nor orchestrator -- register must abort.
+        ts::next_tx(&mut scenario, STRANGER);
+        register_node(&mut scenario, WORKER1, node_a());
 
         ts::end(scenario);
     }

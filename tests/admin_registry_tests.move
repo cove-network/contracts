@@ -1161,4 +1161,230 @@ module cove::admin_registry_tests {
 
         ts::end(scenario);
     }
+
+    // =======================================================================
+    // Orchestrator role -- least-privilege role for the orchestrator. Orchestrators
+    // satisfy `is_admin_or_orchestrator` but NOT `is_admin`, and are managed
+    // exclusively by the super admin.
+    // =======================================================================
+
+    #[test]
+    fun test_super_admin_can_add_orchestrator() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+
+            admin_registry::add_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+
+            // USER1 is an orchestrator...
+            assert!(admin_registry::is_orchestrator(&registry, USER1), 0);
+            // ...and satisfies the orchestrator gate...
+            assert!(admin_registry::is_admin_or_orchestrator(&registry, USER1), 1);
+            // ...but is NOT an admin or super admin (least privilege).
+            assert!(!admin_registry::is_admin(&registry, USER1), 2);
+            assert!(!admin_registry::is_super_admin(&registry, USER1), 3);
+            assert!(admin_registry::orchestrator_count(&registry) == 1, 4);
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_super_admin_can_remove_orchestrator() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+
+            admin_registry::add_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+            assert!(admin_registry::is_orchestrator(&registry, USER1), 0);
+
+            admin_registry::remove_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+            assert!(!admin_registry::is_orchestrator(&registry, USER1), 1);
+            assert!(!admin_registry::is_admin_or_orchestrator(&registry, USER1), 2);
+            assert!(admin_registry::orchestrator_count(&registry) == 0, 3);
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = admin_registry::EAlreadyOrchestrator)]
+    fun test_cannot_add_duplicate_orchestrator() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+
+            admin_registry::add_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+            admin_registry::add_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = admin_registry::ENotOrchestrator)]
+    fun test_cannot_remove_nonexistent_orchestrator() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+
+            admin_registry::remove_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = admin_registry::ENotSuperAdmin)]
+    fun test_regular_admin_cannot_add_orchestrator() {
+        let mut scenario = setup();
+
+        // ADMIN grants USER1 regular-admin status.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+            admin_registry::add_admin(&mut registry, USER1, b"user1", &clock, ts::ctx(&mut scenario));
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        // A regular admin must NOT be able to add orchestrators -- super admin only.
+        ts::next_tx(&mut scenario, USER1);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 2000);
+            admin_registry::add_orchestrator(&mut registry, USER2, &clock, ts::ctx(&mut scenario));
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = admin_registry::ENotSuperAdmin)]
+    fun test_non_admin_cannot_add_orchestrator() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, USER1);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+            admin_registry::add_orchestrator(&mut registry, USER2, &clock, ts::ctx(&mut scenario));
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_admins_satisfy_is_admin_or_orchestrator_without_being_orchestrators() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+            admin_registry::add_admin(&mut registry, USER1, b"user1", &clock, ts::ctx(&mut scenario));
+
+            // Super admin and regular admin both pass the orchestrator gate even
+            // though neither is in the orchestrator set.
+            assert!(admin_registry::is_admin_or_orchestrator(&registry, ADMIN), 0);
+            assert!(admin_registry::is_admin_or_orchestrator(&registry, USER1), 1);
+            assert!(!admin_registry::is_orchestrator(&registry, ADMIN), 2);
+            assert!(!admin_registry::is_orchestrator(&registry, USER1), 3);
+            // A complete stranger passes neither gate.
+            assert!(!admin_registry::is_admin_or_orchestrator(&registry, USER2), 4);
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_orchestrators_list_and_count() {
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+
+            admin_registry::add_orchestrator(&mut registry, USER1, &clock, ts::ctx(&mut scenario));
+            admin_registry::add_orchestrator(&mut registry, USER2, &clock, ts::ctx(&mut scenario));
+
+            assert!(admin_registry::orchestrator_count(&registry) == 2, 0);
+            let ops = admin_registry::orchestrators(&registry);
+            assert!(ops.length() == 2, 1);
+            assert!(ops.contains(&USER1), 2);
+            assert!(ops.contains(&USER2), 3);
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_orchestrator_can_also_be_super_admin_independently() {
+        // The orchestrator set is independent of admin status: the super admin can
+        // be added as an orchestrator too (the roles don't conflict). This keeps the
+        // gate logic simple -- is_admin_or_orchestrator is just an OR.
+        let mut scenario = setup();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+
+            admin_registry::add_orchestrator(&mut registry, ADMIN, &clock, ts::ctx(&mut scenario));
+            assert!(admin_registry::is_orchestrator(&registry, ADMIN), 0);
+            assert!(admin_registry::is_super_admin(&registry, ADMIN), 1);
+            assert!(admin_registry::is_admin_or_orchestrator(&registry, ADMIN), 2);
+
+            clock::destroy_for_testing(clock);
+            ts::return_shared(registry);
+        };
+
+        ts::end(scenario);
+    }
 }

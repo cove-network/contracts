@@ -12,6 +12,9 @@ module cove::treasury_tests {
     const ADMIN: address = @0xAD;
     const USER1: address = @0x1;
     const USER2: address = @0x2;
+    /// The orchestrator's least-privilege role -- may withdraw community
+    /// rewards for worker bonuses, but NOT touch any other treasury pool.
+    const ORCHESTRATOR: address = @0x0B;
 
     // ─── Pool allocations (9 decimals) ──────────────────────────────────────
 
@@ -344,6 +347,75 @@ module cove::treasury_tests {
             let (_, _, used) = treasury::cap_status(&treasury, b"community");
             assert!(used == amount, 301);
             transfer::public_transfer(coin, ADMIN);
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(treasury);
+        };
+        ts::end(scenario);
+    }
+
+    // The orchestrator (an ORCHESTRATOR, not an admin) pays worker bonuses from the
+    // community pool. It must be able to call withdraw_community_rewards...
+    #[test]
+    fun test_orchestrator_can_withdraw_community_rewards() {
+        let mut scenario = setup_initialized_treasury();
+        let amount: u64 = 50_000_000_000_000; // 50k, within the 100k cap
+
+        // Super admin promotes ORCHESTRATOR into the orchestrator set.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+            admin_registry::add_orchestrator(&mut admin_reg, ORCHESTRATOR, &clock, ts::ctx(&mut scenario));
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+        };
+
+        ts::next_tx(&mut scenario, ORCHESTRATOR);
+        {
+            let mut treasury = ts::take_shared<Treasury>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            let coin = treasury::withdraw_community_rewards(
+                &mut treasury, &admin_reg, amount, &clock, ts::ctx(&mut scenario),
+            );
+            assert!(coin::value(&coin) == amount, 0);
+            transfer::public_transfer(coin, ORCHESTRATOR);
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(treasury);
+        };
+        ts::end(scenario);
+    }
+
+    // ...but it must NOT be able to touch any OTHER pool. Least privilege: an
+    // orchestrator pulling from the liquidity pool aborts ENotAdmin.
+    #[test]
+    #[expected_failure(abort_code = treasury::ENotAdmin)]
+    fun test_orchestrator_cannot_withdraw_other_pools() {
+        let mut scenario = setup_initialized_treasury();
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            clock::set_for_testing(&mut clock, 1000);
+            admin_registry::add_orchestrator(&mut admin_reg, ORCHESTRATOR, &clock, ts::ctx(&mut scenario));
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+        };
+
+        ts::next_tx(&mut scenario, ORCHESTRATOR);
+        {
+            let mut treasury = ts::take_shared<Treasury>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            // Liquidity pool is admin-only -- orchestrator has no business here.
+            let coin = treasury::withdraw_liquidity(
+                &mut treasury, &admin_reg, 1_000_000_000, &clock, ts::ctx(&mut scenario),
+            );
+            transfer::public_transfer(coin, ORCHESTRATOR);
             clock::destroy_for_testing(clock);
             ts::return_shared(admin_reg);
             ts::return_shared(treasury);
