@@ -1300,7 +1300,8 @@ module cove::presale {
         presale: &mut Presale,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Super-admin only: version migrations follow package upgrades.
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(presale.version < VERSION, EWrongVersion);
         presale.version = VERSION;
     }
@@ -1316,7 +1317,8 @@ module cove::presale {
         registry: &mut PurchaseRegistry,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Super-admin only: version migrations follow package upgrades.
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(registry.version < VERSION, EWrongVersion);
         registry.version = VERSION;
     }

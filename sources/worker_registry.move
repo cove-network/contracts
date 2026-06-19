@@ -351,7 +351,8 @@ module cove::worker_registry {
         ctx: &mut TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: the orchestrator auto-registers workers on connect.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(!table::contains(&registry.banned, worker_wallet), EWorkerBanned);
 
         // Ensure the wallet's inner (node_id → Worker) table exists.
@@ -432,7 +433,9 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: the orchestrator refreshes a worker's tier when its
+        // verified COVE balance changes.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
 
         let old_tier = worker.tier;
         let new_tier = calculate_tier(registry, verified_balance);
@@ -611,6 +614,7 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
+        assert!(worker.version == VERSION, EWrongVersion);
         assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(worker.status != STATUS_SUSPENDED, EInvalidStatusTransition);
         assert!(worker.status != STATUS_BANNED, EInvalidStatusTransition);
@@ -649,6 +653,7 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
+        assert!(worker.version == VERSION, EWrongVersion);
         assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(worker.status == STATUS_SUSPENDED, EWorkerNotRegistered);
         assert!(worker.tier >= TIER_BRONZE, EInvalidTier);
@@ -1029,13 +1034,13 @@ module cove::worker_registry {
     /// Must be called once by the admin after every package upgrade, before any
     /// other registry operations can succeed.
     ///
-    /// Caller: admin only.
+    /// Caller: super admin only (version migrations follow package upgrades).
     public fun migrate_registry(
         registry: &mut WorkerRegistry,
         admin_reg: &AdminRegistry,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(registry.version < VERSION, EWrongVersion);
         registry.version = VERSION;
     }
@@ -1046,14 +1051,14 @@ module cove::worker_registry {
     /// upgrade. Workers whose objects have not been migrated will fail on
     /// any operation that checks `worker.version`.
     ///
-    /// Caller: admin only.
+    /// Caller: super admin only (version migrations follow package upgrades).
     public fun migrate_worker(
         registry: &WorkerRegistry,
         admin_reg: &AdminRegistry,
         worker: &mut Worker,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(worker.version < VERSION, EWrongVersion);
         worker.version = VERSION;
     }

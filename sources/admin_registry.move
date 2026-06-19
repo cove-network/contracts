@@ -8,6 +8,13 @@
 ///   2. **Regular Admins** -- Addresses granted admin status by the super admin. They
 ///      can act as admins in other Cove contracts and may voluntarily renounce their
 ///      own status, but cannot modify anyone else's.
+///   3. **Orchestrators** -- A least-privilege role for the automated orchestrator. An
+///      orchestrator is NOT an admin: it can only call the narrow set of operational
+///      entry points that gate on `is_admin_or_orchestrator` (worker registration + tier
+///      updates, settlement, and community-pool reward withdrawals for worker bonuses).
+///      It cannot touch governance, other treasury pools, supply locking, or worker
+///      bans. This keeps the orchestrator's hot key scoped to exactly what it needs.
+///      Orchestrators are managed by the super admin via `add_orchestrator` / `remove_orchestrator`.
 ///
 /// The `AdminRegistry` is published as a **shared object** so that any transaction can
 /// read it (e.g. the orchestrator calling `is_admin` for auth checks), while mutations
@@ -24,6 +31,7 @@
 /// - Error-code numeric values are part of the contract ABI -- do not renumber them.
 module cove::admin_registry {
     use sui::table::{Self, Table};
+    use sui::vec_set::{Self, VecSet};
     use sui::clock::{Self, Clock};
     use sui::event;
 
@@ -44,6 +52,10 @@ module cove::admin_registry {
     const EWrongVersion: u64 = 5;
     /// No pending super-admin transfer to accept.
     const ENoPendingTransfer: u64 = 6;
+    /// Target address is already a registered orchestrator.
+    const EAlreadyOrchestrator: u64 = 7;
+    /// Target address is not a registered orchestrator.
+    const ENotOrchestrator: u64 = 8;
 
     // === Version Constant ===
 
@@ -74,6 +86,10 @@ module cove::admin_registry {
         admins: Table<address, AdminInfo>,
         /// Number of entries in `admins` (excludes super admin).
         admin_count: u64,
+        /// Least-privilege orchestrator set (typically just the orchestrator). Orchestrators
+        /// are NOT admins -- they only pass `is_admin_or_orchestrator` gates. A small set,
+        /// so a `VecSet` keeps membership + listing cheap and simple.
+        orchestrators: VecSet<address>,
     }
 
     /// Metadata attached to each regular admin entry.
@@ -111,6 +127,20 @@ module cove::admin_registry {
         timestamp: u64,
     }
 
+    /// Emitted when an orchestrator is added to the least-privilege orchestrator set.
+    public struct OrchestratorAdded has copy, drop {
+        orchestrator: address,
+        added_by: address,
+        timestamp: u64,
+    }
+
+    /// Emitted when an orchestrator is removed from the orchestrator set.
+    public struct OrchestratorRemoved has copy, drop {
+        orchestrator: address,
+        removed_by: address,
+        timestamp: u64,
+    }
+
     // === Initialization ===
 
     /// Module initializer -- called exactly once at publish time.
@@ -125,6 +155,7 @@ module cove::admin_registry {
             pending_super_admin: option::none(),
             admins: table::new(ctx),
             admin_count: 0,
+            orchestrators: vec_set::empty(),
         };
 
         transfer::share_object(registry);
@@ -297,6 +328,61 @@ module cove::admin_registry {
         });
     }
 
+    // === Orchestrator Management ===
+    // Orchestrators are a least-privilege role for the automated orchestrator. They
+    // are managed exclusively by the super admin and only satisfy the
+    // `is_admin_or_orchestrator` gate -- never `is_admin`.
+
+    /// Add an address to the orchestrator set.
+    ///
+    /// Callable by: **super admin only**.
+    ///
+    /// Aborts if `orchestrator` is already an orchestrator. Note an orchestrator may also be
+    /// a regular admin or the super admin (the roles are independent), but adding
+    /// the same address twice as an orchestrator aborts. Emits `OrchestratorAdded`.
+    public fun add_orchestrator(
+        registry: &mut AdminRegistry,
+        orchestrator: address,
+        clock: &Clock,
+        ctx: &TxContext
+    ) {
+        assert!(registry.version == VERSION, EWrongVersion);
+        assert!(tx_context::sender(ctx) == registry.super_admin, ENotSuperAdmin);
+        assert!(!vec_set::contains(&registry.orchestrators, &orchestrator), EAlreadyOrchestrator);
+
+        vec_set::insert(&mut registry.orchestrators, orchestrator);
+
+        event::emit(OrchestratorAdded {
+            orchestrator,
+            added_by: tx_context::sender(ctx),
+            timestamp: clock::timestamp_ms(clock),
+        });
+    }
+
+    /// Remove an address from the orchestrator set.
+    ///
+    /// Callable by: **super admin only**.
+    ///
+    /// Aborts if `orchestrator` is not currently an orchestrator. Emits `OrchestratorRemoved`.
+    public fun remove_orchestrator(
+        registry: &mut AdminRegistry,
+        orchestrator: address,
+        clock: &Clock,
+        ctx: &TxContext
+    ) {
+        assert!(registry.version == VERSION, EWrongVersion);
+        assert!(tx_context::sender(ctx) == registry.super_admin, ENotSuperAdmin);
+        assert!(vec_set::contains(&registry.orchestrators, &orchestrator), ENotOrchestrator);
+
+        vec_set::remove(&mut registry.orchestrators, &orchestrator);
+
+        event::emit(OrchestratorRemoved {
+            orchestrator,
+            removed_by: tx_context::sender(ctx),
+            timestamp: clock::timestamp_ms(clock),
+        });
+    }
+
     // === View Functions ===
     // Read-only accessors used by the orchestrator and other on-chain modules
     // to check permissions. None of these mutate state.
@@ -313,6 +399,30 @@ module cove::admin_registry {
     /// Returns `true` if `addr` is specifically the super admin.
     public fun is_super_admin(registry: &AdminRegistry, addr: address): bool {
         addr == registry.super_admin
+    }
+
+    /// Returns `true` if `addr` is in the least-privilege orchestrator set.
+    public fun is_orchestrator(registry: &AdminRegistry, addr: address): bool {
+        vec_set::contains(&registry.orchestrators, &addr)
+    }
+
+    /// Returns `true` if `addr` has admin privileges OR is an orchestrator. This is
+    /// the gate for the narrow set of operational entry points the orchestrator
+    /// drives (worker registration + tier, settlement, community-reward
+    /// withdrawals). Admins keep full access; orchestrators get only these paths.
+    public fun is_admin_or_orchestrator(registry: &AdminRegistry, addr: address): bool {
+        is_admin(registry, addr) || vec_set::contains(&registry.orchestrators, &addr)
+    }
+
+    /// Returns the full orchestrator set as a vector of addresses (for off-chain
+    /// listing). Order is insertion order; the set is small.
+    public fun orchestrators(registry: &AdminRegistry): vector<address> {
+        *vec_set::keys(&registry.orchestrators)
+    }
+
+    /// Returns the number of orchestrators.
+    public fun orchestrator_count(registry: &AdminRegistry): u64 {
+        vec_set::length(&registry.orchestrators)
     }
 
     /// Returns the current super-admin address.

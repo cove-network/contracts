@@ -10,8 +10,7 @@
 ///   - Distribution: 25% presale, 25% team (4yr vest, 1yr cliff),
 ///                   30% liquidity, 10% community rewards, 10% reserve
 ///   - There is no public_sale pool — DEX listing takes over price discovery
-///     post-presale. The vestigial `public_sale_amount()` accessor returns 0
-///     (kept for ABI compatibility; remove on the next major package version).
+///     post-presale.
 ///   - Actual minting happens in `treasury::initialize_distribution()`, not here
 ///
 /// The TreasuryCap is the ONLY way to mint or burn COVE. Whoever holds it
@@ -41,9 +40,6 @@ module cove::cove_token {
     const LIQUIDITY_AMOUNT: u64 = 3_000_000_000_000_000_000;    // 30% - 3B
     const COMMUNITY_AMOUNT: u64 = 1_000_000_000_000_000_000;    // 10% - 1B
     const TREASURY_AMOUNT: u64 = 1_000_000_000_000_000_000;     // 10% - 1B (reserve pool)
-    // There is no public sale. The accessor returns 0; the constant
-    // is kept at 0 so legacy callers that read it observe the same value.
-    const PUBLIC_SALE_AMOUNT: u64 = 0;
 
     // =========================================================================
     // Init - Package publish entry point
@@ -77,22 +73,11 @@ module cove::cove_token {
     }
 
     // =========================================================================
-    // Public Functions - Mint & Burn
+    // Public Functions - Burn
     // =========================================================================
-
-    /// Mint new COVE tokens and send them to a recipient.
-    /// Can only be called by whoever holds the TreasuryCap (should be the
-    /// Treasury contract after setup). Used by `treasury::initialize_distribution()`
-    /// to mint the full 10B supply into pool balances.
-    public fun mint(
-        treasury_cap: &mut TreasuryCap<COVE_TOKEN>,
-        amount: u64,
-        recipient: address,
-        ctx: &mut TxContext
-    ) {
-        let minted_coin = coin::mint(treasury_cap, amount, ctx);
-        transfer::public_transfer(minted_coin, recipient);
-    }
+    // Minting is done directly via `coin::mint` inside
+    // `treasury::initialize_distribution()` (the TreasuryCap holder), so this
+    // module intentionally exposes no mint wrapper.
 
     /// Permanently destroy COVE tokens, reducing circulating supply.
     /// Can only be called by the TreasuryCap holder.
@@ -115,7 +100,6 @@ module cove::cove_token {
     public fun liquidity_amount(): u64 { LIQUIDITY_AMOUNT }
     public fun community_amount(): u64 { COMMUNITY_AMOUNT }
     public fun treasury_reserve_amount(): u64 { TREASURY_AMOUNT }
-    public fun public_sale_amount(): u64 { PUBLIC_SALE_AMOUNT }
 
     // =========================================================================
     // Test Helpers

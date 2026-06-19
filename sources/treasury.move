@@ -567,7 +567,9 @@ module cove::treasury {
         ctx: &mut TxContext
     ): Coin<COVE_TOKEN> {
         assert!(treasury.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: the orchestrator pays worker tier-bonuses + chunkify
+        // rewards from the community pool. Still bounded by the per-pool 24h cap.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(amount > 0, EInvalidAmount);
         assert!(balance::value(&treasury.community_pool) >= amount, EInsufficientBalance);
 
@@ -971,7 +973,7 @@ module cove::treasury {
         admin_reg: &AdminRegistry,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(treasury.version < VERSION, EWrongVersion);
         treasury.version = VERSION;
     }
@@ -981,7 +983,7 @@ module cove::treasury {
         admin_reg: &AdminRegistry,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(registry.version < VERSION, EWrongVersion);
         registry.version = VERSION;
     }
@@ -991,7 +993,7 @@ module cove::treasury {
         admin_reg: &AdminRegistry,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(schedule.version < VERSION, EWrongVersion);
         schedule.version = VERSION;
     }

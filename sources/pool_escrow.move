@@ -462,7 +462,8 @@ module cove::pool_escrow {
         ctx: &mut TxContext
     ): SettlementBatch {
         assert!(pool.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: the orchestrator runs settlement every cycle.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(!pool.settlement_in_progress, ESettlementInProgress);
 
         let timestamp = clock::timestamp_ms(clock);
@@ -549,7 +550,8 @@ module cove::pool_escrow {
         ctx: &mut TxContext
     ) {
         assert!(pool.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: settlement pays each worker their earned amount.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(pool.settlement_in_progress, ENoSettlementInProgress);
         assert!(!batch.finalized, ESettlementInProgress);
 
@@ -621,7 +623,8 @@ module cove::pool_escrow {
         ctx: &TxContext
     ) {
         assert!(pool.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: settlement closes the batch and clears the lock.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(pool.settlement_in_progress, ENoSettlementInProgress);
         assert!(!batch.finalized, ESettlementInProgress);
 
@@ -810,14 +813,14 @@ module cove::pool_escrow {
     /// the admin must call this to bump the pool's stored version. Until migration,
     /// all mutating functions will revert with `EWrongVersion`.
     ///
-    /// **Caller**: Admin only.
+    /// **Caller**: Super admin only (version migrations follow package upgrades).
     /// **Preconditions**: `pool.version < VERSION` (i.e., pool is behind current package).
     public fun migrate(
         pool: &mut EscrowPool,
         admin_reg: &AdminRegistry,
         ctx: &TxContext
     ) {
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(pool.version < VERSION, EWrongVersion);
         pool.version = VERSION;
     }
