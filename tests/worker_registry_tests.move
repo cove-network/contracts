@@ -1434,4 +1434,66 @@ module cove::worker_registry_tests {
 
         ts::end(scenario);
     }
+
+    // -----------------------------------------------------------------
+    // Orchestrator can update_capabilities (v2): the orchestrator pushes
+    // verified-probe refreshes on the same least-privilege path as
+    // register / update_worker_tier (NOT admin-only).
+    // -----------------------------------------------------------------
+    #[test]
+    fun test_orchestrator_can_update_capabilities() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        grant_orchestrator(&mut scenario, ORCHESTRATOR);
+
+        // Orchestrator registers the node, then refreshes its caps -- both on
+        // the orchestrator's least-privilege path (no admin rights).
+        ts::next_tx(&mut scenario, ORCHESTRATOR);
+        register_node(&mut scenario, WORKER1, node_a());
+
+        ts::next_tx(&mut scenario, ORCHESTRATOR);
+        {
+            let registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut worker = ts::take_shared<Worker>(&scenario);
+            worker_registry::update_capabilities(
+                &registry, &admin_reg, &mut worker,
+                2, 0xDEAD, 48, 32, 1, 0x0B, 22, 2,
+                ts::ctx(&mut scenario),
+            );
+            ts::return_shared(registry);
+            ts::return_shared(admin_reg);
+            ts::return_shared(worker);
+        };
+
+        ts::end(scenario);
+    }
+
+    // A stranger (neither admin nor orchestrator) still cannot update caps.
+    #[test]
+    #[expected_failure(abort_code = worker_registry::ENotAdmin)]
+    fun test_stranger_cannot_update_capabilities() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        register_node(&mut scenario, WORKER1, node_a());
+
+        ts::next_tx(&mut scenario, STRANGER);
+        {
+            let registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut worker = ts::take_shared<Worker>(&scenario);
+            worker_registry::update_capabilities(
+                &registry, &admin_reg, &mut worker,
+                2, 0xDEAD, 48, 32, 1, 0x0B, 22, 2,
+                ts::ctx(&mut scenario),
+            );
+            ts::return_shared(registry);
+            ts::return_shared(admin_reg);
+            ts::return_shared(worker);
+        };
+
+        ts::end(scenario);
+    }
 }

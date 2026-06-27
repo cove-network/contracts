@@ -555,15 +555,17 @@ module cove::worker_registry {
 
     /// Update a worker's hardware capabilities profile.
     ///
-    /// Admin-gated in v2: the orchestrator is the source of truth for what an
-    /// agent's hardware looks like (the verified-hardware probe results stream
-    /// in via WS), and the operator's wallet does not sign from the box, so
-    /// capability updates are pushed by the orchestrator just like tier
-    /// updates. A wallet-signed self-update is no longer offered; if an
-    /// operator wants to force a refresh, they restart the agent and the
-    /// probe runs again.
+    /// Orchestrator-allowed in v2 (same as `register` / `update_worker_tier`):
+    /// the orchestrator is the source of truth for what an agent's hardware
+    /// looks like (the verified-hardware probe results stream in via WS), and
+    /// the operator's wallet does not sign from the box, so capability updates
+    /// are pushed by the orchestrator. It refreshes the profile when a later
+    /// probe measures different caps than the first registration (e.g. per-
+    /// device concurrency summing now counts a 2nd GPU + the CPU lane), keeping
+    /// the on-chain record in sync with reality. A wallet-signed self-update is
+    /// not offered; to force a refresh, restart the agent and the probe reruns.
     ///
-    /// Caller: admin only.
+    /// Caller: admin OR orchestrator.
     public fun update_capabilities(
         registry: &WorkerRegistry,
         admin_reg: &AdminRegistry,
@@ -580,7 +582,9 @@ module cove::worker_registry {
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
         assert!(worker.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // Orchestrator-allowed: capability refreshes are pushed by the
+        // orchestrator on behalf of agents that hold only a bearer token.
+        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
 
         worker.capabilities = WorkerCapabilities {
             gpu_type,

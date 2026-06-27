@@ -17,6 +17,20 @@ sui client publish --gas-budget 100000000
 
 **IMPORTANT**: Store the `UpgradeCap` object ID securely. Without it, you cannot upgrade.
 
+## How Cove upgrades this package
+
+Cove upgrades in place under the **`compatible`** policy — new functions, new
+modules, and changed function bodies ship without disturbing any shared object
+(the worker registry, escrow pool, treasury, and every balance are preserved).
+Struct or signature changes are never upgraded in place; those require a fresh
+publish.
+
+The `UpgradeCap` is held on a **hardware wallet** (the project's super-admin
+key), and every upgrade is signed as a normal on-chain transaction through the
+Cove admin dashboard. So the upgrade authority is a single hardware-secured key,
+and each upgrade is publicly verifiable on-chain against the source in this
+repository.
+
 ## Upgrade Policies
 
 Sui supports these upgrade policies (set at publish time):
