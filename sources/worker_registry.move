@@ -433,6 +433,10 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
+        // Guard the Worker object's version too (matches suspend/reactivate/
+        // update_capabilities): a stale, un-migrated Worker must fail closed
+        // after an upgrade rather than be mutated under old field semantics.
+        assert!(worker.version == VERSION, EWrongVersion);
         // Orchestrator-allowed: the orchestrator refreshes a worker's tier when its
         // verified COVE balance changes.
         assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
@@ -512,6 +516,7 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
+        assert!(worker.version == VERSION, EWrongVersion);
         assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
 
         // Saturating add for lifetime counters to prevent u64 overflow
@@ -700,6 +705,7 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
+        assert!(worker.version == VERSION, EWrongVersion);
         assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
         assert!(worker.status != STATUS_BANNED, EInvalidStatusTransition);
 
@@ -748,6 +754,7 @@ module cove::worker_registry {
         ctx: &TxContext
     ) {
         assert!(registry.version == VERSION, EWrongVersion);
+        assert!(worker.version == VERSION, EWrongVersion);
         let sender = tx_context::sender(ctx);
         assert!(admin_registry::is_admin(admin_reg, sender), ENotAdmin);
 
