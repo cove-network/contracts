@@ -878,6 +878,181 @@ module cove::presale_tests {
     }
 
     // -----------------------------------------------------------------------
+    // 10b. set_vesting_terms — fat-finger ceiling on vesting duration.
+    //      The terms freeze on first purchase and can never be re-set, so an
+    //      absurd duration would permanently strand buyers. The upper bound
+    //      (MAX_VESTING_DURATION_MS = 5y) blocks that NON-recoverable state.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[expected_failure(abort_code = presale::EInvalidBounds)]
+    fun test_set_vesting_terms_rejects_excessive_duration() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, ADMIN); // ADMIN = super-admin in setup
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // 5 years + 1 ms — just over the ceiling. Must abort EInvalidBounds.
+            presale::set_vesting_terms(
+                &admin_reg, &mut presale, 25, 157_680_000_001, &clock, ts::ctx(&mut scenario),
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_set_vesting_terms_accepts_max_duration() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // Exactly the ceiling (5y) is allowed; a normal 90d would be too.
+            presale::set_vesting_terms(
+                &admin_reg, &mut presale, 25, 157_680_000_000, &clock, ts::ctx(&mut scenario),
+            );
+            assert!(presale::vesting_duration_ms(&presale) == 157_680_000_000, 0);
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = presale::EInvalidBounds)]
+    fun test_set_vesting_terms_rejects_zero_duration() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // duration 0 is rejected (lower bound).
+            presale::set_vesting_terms(
+                &admin_reg, &mut presale, 25, 0, &clock, ts::ctx(&mut scenario),
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// set_stage_prices rejects a ladder that steps DOWN between stages
+    /// (stage i end > stage i+1 start) — the cross-stage continuity guard.
+    #[test]
+    #[expected_failure(abort_code = presale::EInvalidBounds)]
+    fun test_set_stage_prices_rejects_cross_stage_step_down() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // stage0 end (2500) > stage1 start (2000) → cross-stage step down.
+            let starts = vector[1000u64, 2000, 3000, 4000, 5000];
+            let ends = vector[2500u64, 2500, 3500, 4500, 5500];
+            presale::set_stage_prices(&admin_reg, &mut presale, starts, ends, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// A monotonic ladder (each stage end ≤ next stage start) is accepted.
+    #[test]
+    fun test_set_stage_prices_accepts_monotonic_ladder() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let starts = vector[1000u64, 2000, 3000, 4000, 5000];
+            let ends = vector[2000u64, 3000, 4000, 5000, 6000];
+            presale::set_stage_prices(&admin_reg, &mut presale, starts, ends, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// BUYER PROTECTION: once the first purchase lands, parameters_frozen flips
+    /// true and EVERY pre-freeze setter must abort EParametersFrozen — buyers are
+    /// guaranteed the terms they bought under can't be retroactively changed,
+    /// even by the super-admin.
+    #[test]
+    #[expected_failure(abort_code = presale::EParametersFrozen)]
+    fun test_setters_frozen_after_first_purchase() {
+        let (mut scenario, clock) = setup_presale();
+        // BUYER1 purchases → freezes parameters.
+        ts::next_tx(&mut scenario, BUYER1);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let mut registry = ts::take_shared<PurchaseRegistry>(&scenario);
+            let payment = coin::mint_for_testing<SUI>(1_000_000_000, ts::ctx(&mut scenario));
+            presale::purchase(&mut presale, &mut registry, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(registry);
+            ts::return_shared(presale);
+        };
+        // Super-admin retune must now abort — params are frozen.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            presale::set_max_per_wallet_per_stage(
+                &admin_reg, &mut presale, 1_000_000_000_000_000, &clock, ts::ctx(&mut scenario),
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// set_stage_prices rejects a wrong-length vector (must be NUM_STAGES=5).
+    #[test]
+    #[expected_failure(abort_code = presale::EInvalidStagePrices)]
+    fun test_set_stage_prices_rejects_wrong_length() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // Only 4 entries (need 5) → abort.
+            let starts = vector[1000u64, 2000, 3000, 4000];
+            let ends = vector[2000u64, 3000, 4000, 5000];
+            presale::set_stage_prices(&admin_reg, &mut presale, starts, ends, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// Only super-admin may set the per-wallet cap.
+    #[test]
+    #[expected_failure(abort_code = presale::ENotSuperAdmin)]
+    fun test_set_max_per_wallet_non_super_admin_fails() {
+        let (mut scenario, clock) = setup_presale();
+        ts::next_tx(&mut scenario, BUYER1); // not an admin
+        {
+            let mut presale = ts::take_shared<Presale>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            presale::set_max_per_wallet_per_stage(
+                &admin_reg, &mut presale, 1_000_000_000_000_000, &clock, ts::ctx(&mut scenario),
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(presale);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    // -----------------------------------------------------------------------
     // 11. advance_stage works and enforces admin-only
     // -----------------------------------------------------------------------
 
@@ -1113,6 +1288,8 @@ module cove::presale_tests {
         clock::destroy_for_testing(clock);
         ts::end(scenario);
     }
+    #[test]
+    #[expected_failure(abort_code = presale::ENotAdmin)]
     fun test_withdraw_raised_sui_non_admin_fails() {
         let (mut scenario, clock) = setup_presale();
 

@@ -32,6 +32,7 @@
 ///     that stale transactions fail cleanly after a package upgrade.
 module cove::worker_registry {
     use sui::table::{Self, Table};
+    use sui::bag::{Self, Bag};
     use sui::event;
     use sui::clock::{Self, Clock};
     use cove::admin_registry::{Self, AdminRegistry};
@@ -57,6 +58,9 @@ module cove::worker_registry {
     /// function. (For now only set_tier_thresholds; we treat ENotAdmin
     /// as the regular-admin gate and ENotSuperAdmin as stricter.)
     const ENotSuperAdmin: u64 = 9;
+    /// set_reputation_params given rep_start > rep_max (a worker can't start
+    /// above the ceiling).
+    const EInvalidReputationParams: u64 = 10;
 
     // ============================ Version Gate ===============================
 
@@ -150,6 +154,22 @@ module cove::worker_registry {
         silver_threshold: u64,
         gold_threshold: u64,
         platinum_threshold: u64,
+
+        // ─── Tunable reputation policy ──────────────────────────────
+        // Behavioral dials, retunable as we observe gaming. Reputation is
+        // advisory-only (off-chain routing reads it), so ADMIN (operational),
+        // not super-admin. u8 scores in [0, rep_max].
+        rep_start: u8,            // starting reputation for a new worker
+        rep_success_delta: u8,    // +rep per successful job (capped at rep_max)
+        rep_failure_penalty: u8,  // -rep per failed job (floor 0)
+        rep_max: u8,              // ceiling
+
+        /// Forward-compat: future registry-level state attaches here as a
+        /// compatible upgrade — never add struct fields post-publish. New
+        /// orchestrator-driven entry points use the `_v2` add-a-function
+        /// convention (e.g. register_v2) rather than changing a signature.
+        /// See contracts/UPGRADE.md.
+        config: Bag,
     }
 
     /// Per-worker on-chain record, created at registration and shared so that
@@ -188,11 +208,18 @@ module cove::worker_registry {
         minutes_processed: u64,
         /// Cumulative COVE earned across all jobs (with 9 decimals).
         total_earnings: u64,
-        /// Reputation score in [0, 100]. Starts at 50 (neutral).
-        /// +1 per successful job, -5 per failed job, clamped to [0, 100].
+        /// Reputation score, clamped to [0, registry.rep_max]. The start value,
+        /// per-success delta, per-failure penalty, and max are all TUNABLE on the
+        /// WorkerRegistry (set_reputation_params); genesis defaults are start 50,
+        /// +1/success, -5/failure, max 100.
         reputation: u8,
         /// Self-reported hardware profile used for job matching.
         capabilities: WorkerCapabilities,
+        /// Forward-compat: future per-node state (SLA counters, new capability
+        /// flags, geo) attaches here as a compatible upgrade — no struct change,
+        /// no fleet-wide migration sweep over thousands of Workers. Read with a
+        /// default when a key is absent.
+        config: Bag,
     }
 
     /// Self-reported hardware profile submitted at registration.
@@ -303,6 +330,11 @@ module cove::worker_registry {
             silver_threshold:   SILVER_REQUIREMENT,
             gold_threshold:     GOLD_REQUIREMENT,
             platinum_threshold: PLATINUM_REQUIREMENT,
+            rep_start: 50,
+            rep_success_delta: 1,
+            rep_failure_penalty: 5,
+            rep_max: 100,
+            config: bag::new(ctx),
         };
 
         transfer::share_object(registry);
@@ -386,8 +418,9 @@ module cove::worker_registry {
             jobs_completed: 0,
             minutes_processed: 0,
             total_earnings: 0,
-            reputation: 50, // Neutral starting reputation (range 0-100)
+            reputation: registry.rep_start,
             capabilities,
+            config: bag::new(ctx),
         };
 
         let worker_id = object::id(&worker);
@@ -489,9 +522,10 @@ module cove::worker_registry {
     /// Workers cannot call this themselves -- the orchestrator is the source of
     /// truth for job outcomes to prevent workers from inflating their own stats.
     ///
-    /// Reputation update rules (asymmetric to penalize failures heavily):
-    ///   - Success: +1 (capped at 100)
-    ///   - Failure: -5 (floored at 0 via saturating subtraction)
+    /// Reputation update rules (asymmetric to penalize failures heavily), all
+    /// TUNABLE via set_reputation_params (genesis defaults shown):
+    ///   - Success: + rep_success_delta (default 1), capped at rep_max (default 100)
+    ///   - Failure: - rep_failure_penalty (default 5), floored at 0 (saturating)
     ///
     /// The saturating subtraction is critical: `reputation` is u8, so a naive
     /// `reputation - 5` would abort with arithmetic underflow if reputation < 5.
@@ -534,17 +568,18 @@ module cove::worker_registry {
             worker.total_earnings = MAX_U64;
         };
 
-        // Reputation: +1 on success (cap 100), -5 on failure (floor 0)
+        // Reputation: +rep_success_delta on success (capped at rep_max),
+        // -rep_failure_penalty on failure (floor 0). Tunable via
+        // set_reputation_params. u64 intermediate avoids u8 overflow on the add.
         if (success) {
-            if (worker.reputation < 100) {
-                worker.reputation = worker.reputation + 1;
-            };
+            let inc = (worker.reputation as u64) + (registry.rep_success_delta as u64);
+            let cap = (registry.rep_max as u64);
+            worker.reputation = (if (inc > cap) { cap } else { inc }) as u8;
         } else {
-            // Saturating subtract to prevent u8 underflow abort
-            if (worker.reputation >= 5) {
-                worker.reputation = worker.reputation - 5;
+            worker.reputation = if (worker.reputation >= registry.rep_failure_penalty) {
+                worker.reputation - registry.rep_failure_penalty
             } else {
-                worker.reputation = 0;
+                0
             };
         };
 
@@ -554,6 +589,29 @@ module cove::worker_registry {
             minutes,
             earnings,
         });
+    }
+
+    /// Retune the reputation policy. ADMIN (operational dial — reputation is
+    /// advisory-only off-chain routing, not a value/security path), not
+    /// super-admin. Invariant: rep_start <= rep_max (a worker can't start above
+    /// the ceiling). This is a behavioral dial you'll want to A/B as you observe
+    /// gaming — changeable without a republish.
+    public fun set_reputation_params(
+        registry: &mut WorkerRegistry,
+        admin_reg: &AdminRegistry,
+        rep_start: u8,
+        rep_success_delta: u8,
+        rep_failure_penalty: u8,
+        rep_max: u8,
+        ctx: &TxContext
+    ) {
+        assert!(registry.version == VERSION, EWrongVersion);
+        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(rep_start <= rep_max, EInvalidReputationParams);
+        registry.rep_start = rep_start;
+        registry.rep_success_delta = rep_success_delta;
+        registry.rep_failure_penalty = rep_failure_penalty;
+        registry.rep_max = rep_max;
     }
 
     // ====================== Capability Updates ==============================
@@ -802,7 +860,9 @@ module cove::worker_registry {
             total_earnings: _,
             reputation: _,
             capabilities: _,
+            config,
         } = worker;
+        bag::destroy_empty(config);
         object::delete(id);
     }
 

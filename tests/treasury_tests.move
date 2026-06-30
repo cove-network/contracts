@@ -223,7 +223,7 @@ module cove::treasury_tests {
             let team_before = treasury::team_pool_balance(&treasury);
             treasury::create_team_vesting(
                 &mut treasury, &mut registry, &admin_reg,
-                USER1, amount, ONE_YEAR_MS, &clock, ts::ctx(&mut scenario),
+                USER1, amount, ONE_YEAR_MS, FOUR_YEARS_MS, &clock, ts::ctx(&mut scenario),
             );
             assert!(treasury::team_pool_balance(&treasury) == team_before - amount, 200);
             clock::destroy_for_testing(clock);
@@ -247,7 +247,7 @@ module cove::treasury_tests {
             clock::set_for_testing(&mut clock, 0);
             treasury::create_team_vesting(
                 &mut treasury, &mut registry, &admin_reg,
-                USER1, 1_000_000_000_000_000_000, ONE_YEAR_MS, &clock, ts::ctx(&mut scenario),
+                USER1, 1_000_000_000_000_000_000, ONE_YEAR_MS, FOUR_YEARS_MS, &clock, ts::ctx(&mut scenario),
             );
             ts::return_shared(admin_reg);
             ts::return_shared(registry);
@@ -279,7 +279,7 @@ module cove::treasury_tests {
             clock::set_for_testing(&mut clock, 0);
             treasury::create_team_vesting(
                 &mut treasury, &mut registry, &admin_reg,
-                USER1, amount, ONE_YEAR_MS, &clock, ts::ctx(&mut scenario),
+                USER1, amount, ONE_YEAR_MS, FOUR_YEARS_MS, &clock, ts::ctx(&mut scenario),
             );
             ts::return_shared(admin_reg);
             ts::return_shared(registry);
@@ -311,11 +311,11 @@ module cove::treasury_tests {
             let clock = clock::create_for_testing(ts::ctx(&mut scenario));
             treasury::create_team_vesting(
                 &mut treasury, &mut registry, &admin_reg,
-                USER1, 1_000_000_000_000, ONE_YEAR_MS, &clock, ts::ctx(&mut scenario),
+                USER1, 1_000_000_000_000, ONE_YEAR_MS, FOUR_YEARS_MS, &clock, ts::ctx(&mut scenario),
             );
             treasury::create_team_vesting(
                 &mut treasury, &mut registry, &admin_reg,
-                USER1, 1_000_000_000_000, ONE_YEAR_MS, &clock, ts::ctx(&mut scenario),
+                USER1, 1_000_000_000_000, ONE_YEAR_MS, FOUR_YEARS_MS, &clock, ts::ctx(&mut scenario),
             );
             clock::destroy_for_testing(clock);
             ts::return_shared(admin_reg);
@@ -775,5 +775,66 @@ module cove::treasury_tests {
         assert!(treasury::calculate_platform_fee(10_000) == 250, 500);
         // Large amount sanity check — no u64 overflow due to u128 intermediate.
         assert!(treasury::calculate_platform_fee(1_000_000_000_000_000_000) == 25_000_000_000_000_000, 501);
+    }
+
+    /// L3 invariant: a cliff longer than the total vest is rejected (it would
+    /// unlock everything at once). create_team_vesting now takes a per-call
+    /// vesting_duration, so this guard prevents a broken schedule.
+    #[test]
+    #[expected_failure(abort_code = treasury::EInvalidAmount)]
+    fun test_create_team_vesting_rejects_cliff_exceeding_duration() {
+        let mut scenario = setup_initialized_treasury();
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut treasury = ts::take_shared<Treasury>(&scenario);
+            let mut registry = ts::take_shared<VestingRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            // cliff (4y) > vesting (1y) → abort EInvalidAmount.
+            treasury::create_team_vesting(
+                &mut treasury, &mut registry, &admin_reg,
+                USER1, 1_000_000_000_000, FOUR_YEARS_MS, ONE_YEAR_MS, &clock, ts::ctx(&mut scenario),
+            );
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+            ts::return_shared(treasury);
+        };
+        ts::end(scenario);
+    }
+
+    /// A regular admin (not super-admin) must NOT be able to create a team
+    /// vesting grant — it moves up to 2.5B uncapped team_pool COVE, so it's
+    /// super-admin only (matches move_between_pools / the cap setters).
+    #[test]
+    #[expected_failure(abort_code = treasury::ENotSuperAdmin)]
+    fun test_create_team_vesting_requires_super_admin() {
+        let mut scenario = setup_initialized_treasury();
+        // Super-admin (ADMIN) adds USER2 as a regular admin.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            admin_registry::add_admin(&mut admin_reg, USER2, b"ops", &clock, ts::ctx(&mut scenario));
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+        };
+        // USER2 is a regular admin but NOT super-admin → create_team_vesting aborts.
+        ts::next_tx(&mut scenario, USER2);
+        {
+            let mut treasury = ts::take_shared<Treasury>(&scenario);
+            let mut registry = ts::take_shared<VestingRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            treasury::create_team_vesting(
+                &mut treasury, &mut registry, &admin_reg,
+                USER1, 1_000_000_000_000, ONE_YEAR_MS, FOUR_YEARS_MS, &clock, ts::ctx(&mut scenario),
+            );
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+            ts::return_shared(treasury);
+        };
+        ts::end(scenario);
     }
 }

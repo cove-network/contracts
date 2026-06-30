@@ -1496,4 +1496,136 @@ module cove::worker_registry_tests {
 
         ts::end(scenario);
     }
+
+    // ======================== set_reputation_params ==========================
+    // Tunable reputation curve (admin-gated). Genesis defaults: start 50,
+    // +1/success, -5/failure, max 100.
+
+    /// Retuned starting reputation applies to newly-registered workers.
+    #[test]
+    fun test_set_reputation_params_applies_to_new_workers() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // start 70, +2/success, -10/failure, max 90.
+            worker_registry::set_reputation_params(&mut registry, &admin_reg, 70, 2, 10, 90, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+        };
+
+        ts::next_tx(&mut scenario, ADMIN);
+        register_node(&mut scenario, WORKER1, node_a());
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let worker = ts::take_shared<Worker>(&scenario);
+            // New worker starts at the retuned 70, not the genesis 50.
+            assert!(worker_registry::worker_reputation(&worker) == 70, 0);
+            ts::return_shared(worker);
+        };
+        ts::end(scenario);
+    }
+
+    /// rep_start > rep_max is rejected (invariant guard).
+    #[test]
+    #[expected_failure(abort_code = worker_registry::EInvalidReputationParams)]
+    fun test_set_reputation_params_rejects_start_above_max() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            worker_registry::set_reputation_params(&mut registry, &admin_reg, 60, 1, 5, 50, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+        };
+        ts::end(scenario);
+    }
+
+    /// A non-admin (no orchestrator, no admin) cannot retune reputation.
+    #[test]
+    #[expected_failure(abort_code = worker_registry::ENotAdmin)]
+    fun test_set_reputation_params_non_admin_fails() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        ts::next_tx(&mut scenario, STRANGER);
+        {
+            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            worker_registry::set_reputation_params(&mut registry, &admin_reg, 50, 1, 5, 100, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+        };
+        ts::end(scenario);
+    }
+
+    // ======================== set_tier_thresholds ============================
+    // Super-admin tunes the per-tier COVE floors. Strict ascending, no zeros.
+
+    #[test]
+    fun test_set_tier_thresholds_accepts_ascending() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            worker_registry::set_tier_thresholds(
+                &admin_reg, &mut registry, 1_000, 2_000, 3_000, 4_000, &clock, ts::ctx(&mut scenario),
+            );
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+        };
+        ts::end(scenario);
+    }
+
+    /// Non-ascending thresholds (silver <= bronze) are rejected.
+    #[test]
+    #[expected_failure(abort_code = worker_registry::EInvalidTierThresholds)]
+    fun test_set_tier_thresholds_rejects_non_ascending() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            // silver (1000) not > bronze (1000) → abort.
+            worker_registry::set_tier_thresholds(
+                &admin_reg, &mut registry, 1_000, 1_000, 3_000, 4_000, &clock, ts::ctx(&mut scenario),
+            );
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+        };
+        ts::end(scenario);
+    }
+
+    /// Only super-admin may retune tier thresholds.
+    #[test]
+    #[expected_failure(abort_code = worker_registry::ENotSuperAdmin)]
+    fun test_set_tier_thresholds_non_super_admin_fails() {
+        let mut scenario = ts::begin(ADMIN);
+        setup_registry(&mut scenario);
+        ts::next_tx(&mut scenario, STRANGER);
+        {
+            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+            worker_registry::set_tier_thresholds(
+                &admin_reg, &mut registry, 1_000, 2_000, 3_000, 4_000, &clock, ts::ctx(&mut scenario),
+            );
+            clock::destroy_for_testing(clock);
+            ts::return_shared(admin_reg);
+            ts::return_shared(registry);
+        };
+        ts::end(scenario);
+    }
 }

@@ -53,6 +53,7 @@ module cove::presale {
     use sui::clock::{Self, Clock};
     use sui::table::{Self, Table};
     use sui::sui::SUI;
+    use sui::bag::{Self, Bag};
     use sui::event;
     use cove::cove_token::COVE_TOKEN;
     use cove::admin_registry::{Self, AdminRegistry};
@@ -94,6 +95,11 @@ module cove::presale {
     const EInvalidStagePrices: u64 = 20;
     /// 2026-06-08 — immediate_release_pct must be in [0, 100].
     const EInvalidReleasePct: u64 = 21;
+    /// Caller is not the super-admin (the parameter setters require it).
+    const ENotSuperAdmin: u64 = 22;
+    /// A setter was given an out-of-bounds value (cap/window/vest too large, or
+    /// a non-monotonic price ladder).
+    const EInvalidBounds: u64 = 23;
 
     // ============================ Versioning ==================================
 
@@ -125,6 +131,14 @@ module cove::presale {
 
     /// Duration over which the remaining 75% of tokens vest linearly (90 days in ms).
     const VESTING_DURATION_MS: u64 = 7_776_000_000; // 90 * 24 * 60 * 60 * 1000
+
+    /// Fat-finger CEILING (NOT a target) on a settable presale vesting duration.
+    /// 5 years in ms. Unlike the freely re-settable treasury caps, set_vesting_terms
+    /// FREEZES on the first purchase, so an absurd duration set pre-launch can never
+    /// be undone and would strand every buyer's 75% tranche for geological time.
+    /// This is the one presale bound that guards a genuinely-broken, NON-recoverable
+    /// state — the default vest stays 90 days; this only blocks nonsense.
+    const MAX_VESTING_DURATION_MS: u64 = 157_680_000_000; // 5 * 365 * 24 * 60 * 60 * 1000
 
     // ─── L1: withdraw_raised_sui cap defaults ────────────────────────────────
     //
@@ -284,6 +298,11 @@ module cove::presale {
         /// are guaranteed the contract terms they purchased under
         /// cannot be changed retroactively.
         parameters_frozen: bool,
+
+        /// Forward-compat: future presale params (referral bonuses, whitelist,
+        /// stage-count changes) attach here as a compatible upgrade — never add
+        /// struct fields post-publish. See contracts/UPGRADE.md.
+        config: Bag,
     }
 
     /// Per-user purchase record, stored inside `PurchaseRegistry`.
@@ -315,6 +334,10 @@ module cove::presale {
         version: u64,
         /// Mapping from buyer address to purchase record.
         purchases: Table<address, UserPurchase>,
+        /// Forward-compat: future per-buyer or registry state (referral,
+        /// whitelist, bonus tiers) attaches here as a compatible upgrade rather
+        /// than a struct-field add. Permanent object; bag never destroyed.
+        config: Bag,
     }
 
     // =============================== Events ==================================
@@ -454,12 +477,14 @@ module cove::presale {
             immediate_release_pct_value: IMMEDIATE_RELEASE_PCT,
             vesting_duration_ms_value: VESTING_DURATION_MS,
             parameters_frozen: false,
+            config: bag::new(ctx),
         };
 
         let registry = PurchaseRegistry {
             id: object::new(ctx),
             version: VERSION,
             purchases: table::new(ctx),
+            config: bag::new(ctx),
         };
 
         transfer::share_object(presale);
@@ -889,7 +914,7 @@ module cove::presale {
         assert!(presale.version == VERSION, EWrongVersion);
         assert!(
             admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)),
-            ENotAdmin
+            ENotSuperAdmin
         );
         // Sanity: a 0 window would either underflow the rollover math
         // (we already guard with `now >= start + window`) or make the
@@ -939,7 +964,7 @@ module cove::presale {
         assert!(presale.version == VERSION, EWrongVersion);
         assert!(
             admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)),
-            ENotAdmin
+            ENotSuperAdmin
         );
         assert!(!presale.parameters_frozen, EParametersFrozen);
         let n = (NUM_STAGES as u64);
@@ -954,6 +979,11 @@ module cove::presale {
             let e = *vector::borrow(&new_end_prices, i);
             assert!(s > 0, EInvalidStagePrices);
             assert!(e >= s, EInvalidStagePrices);
+            // Cross-stage continuity: the ladder must not step DOWN between
+            // stages (a backward fat-finger). stage i end <= stage i+1 start.
+            if (i + 1 < n) {
+                assert!(e <= *vector::borrow(&new_start_prices, i + 1), EInvalidBounds);
+            };
             i = i + 1;
         };
         presale.stage_start_prices = new_start_prices;
@@ -977,7 +1007,7 @@ module cove::presale {
         assert!(presale.version == VERSION, EWrongVersion);
         assert!(
             admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)),
-            ENotAdmin
+            ENotSuperAdmin
         );
         assert!(!presale.parameters_frozen, EParametersFrozen);
         let old_max = presale.max_per_wallet_per_stage_value;
@@ -1003,11 +1033,16 @@ module cove::presale {
         assert!(presale.version == VERSION, EWrongVersion);
         assert!(
             admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)),
-            ENotAdmin
+            ENotSuperAdmin
         );
         assert!(!presale.parameters_frozen, EParametersFrozen);
         assert!(new_immediate_pct <= 100, EInvalidReleasePct);
-        assert!(new_vesting_duration_ms > 0, EInvalidReleasePct);
+        // Lower + UPPER bound. These terms freeze on the first purchase and can
+        // never be re-set, so the upper bound is warranted here (and only here)
+        // to block a non-recoverable, buyer-harming duration. 5y ceiling; the
+        // 90-day default is unaffected. See MAX_VESTING_DURATION_MS.
+        assert!(new_vesting_duration_ms > 0, EInvalidBounds);
+        assert!(new_vesting_duration_ms <= MAX_VESTING_DURATION_MS, EInvalidBounds);
         let old_immediate_pct = presale.immediate_release_pct_value;
         let old_duration = presale.vesting_duration_ms_value;
         presale.immediate_release_pct_value = new_immediate_pct;
@@ -1301,7 +1336,7 @@ module cove::presale {
         ctx: &TxContext
     ) {
         // Super-admin only: version migrations follow package upgrades.
-        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(presale.version < VERSION, EWrongVersion);
         presale.version = VERSION;
     }
@@ -1318,7 +1353,7 @@ module cove::presale {
         ctx: &TxContext
     ) {
         // Super-admin only: version migrations follow package upgrades.
-        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(registry.version < VERSION, EWrongVersion);
         registry.version = VERSION;
     }

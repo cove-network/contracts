@@ -45,19 +45,40 @@ For production, use `compatible` - it allows adding new functions and types whil
 
 ## What CAN Be Upgraded
 
-- Add new functions
+- Add new functions (including new `public` entry points — e.g. a `register_v2`
+  beside an unchanged `register`)
 - Add new structs/types
 - Add new modules
-- Change function implementations (logic)
-- Add new fields to existing structs (with care)
+- Change function implementations (logic / bodies)
 
 ## What CANNOT Be Upgraded
 
-- Change existing function signatures
+- **Add, remove, reorder, or retype fields on an existing struct** — a struct's
+  layout is frozen at its first publish. This is the single most common
+  misconception; there is no "add a field with care." Adding a field is a
+  fresh-publish-only change.
+- Change existing function signatures (params or return types)
 - Remove existing public functions
-- Change struct field types
-- Remove struct fields
 - Change module names
+
+### How Cove adds state without a republish
+
+Because struct fields are frozen, every long-lived object ships with an empty
+**`config: sui::bag::Bag`**: `EscrowPool`, `SettlementBatch`, `AdminRegistry`,
+`WorkerRegistry`, `Worker`, `Treasury`, `VestingSchedule`, `VestingRegistry`,
+`Presale`, and `PurchaseRegistry`. (`cove_token` is intentionally excluded — it
+defines no mutable shared object; the COVE coin type's identity is frozen at
+first publish and must never gain a field.) Future per-object state attaches into
+that `Bag` (or as a dynamic field on the object's `UID`) as a *compatible*
+upgrade — no struct change, no fresh publish. NOTE: the two ephemeral objects
+(`SettlementBatch`, and any future deletable object) `bag::destroy_empty` their
+bag on consume, so anything written into those must be removed before the object
+is destroyed; the permanent singletons never destroy theirs.
+Likewise, anything that would otherwise need a signature change is added as a
+new `fn_v2` next to the original. Bound-style policy knobs (fees, caps, rep
+curve, vesting durations) are plain mutable fields with admin setters, so they
+retune live without any upgrade at all. **Plan new state to land in the `Bag` or
+a new function — never by editing a struct.**
 
 ## Performing an Upgrade
 
@@ -75,10 +96,15 @@ sui client upgrade --gas-budget 100000000 --upgrade-capability <UPGRADE_CAP_ID>
 
 ## Best Practices
 
-1. **Version your contracts** - Add a `version` constant to track deployments
+1. **Version your contracts** - every shared object carries a `version` constant
+   guarded by `EWrongVersion`; bump it and add a `migrate()` when an upgrade
+   changes an object's interpretation
 2. **Test upgrades on testnet first**
-3. **Keep UpgradeCap in a multisig** - For production, transfer to a multisig address
-4. **Document breaking changes** - Some changes require migration
+3. **Keep the UpgradeCap on hardware** - hold it on a hardware wallet (or a
+   multisig); never a hot key. Cove holds it on the super-admin's hardware wallet
+   and signs each upgrade through the admin dashboard
+4. **Design new state into the `config` Bag, not new struct fields** (see above)
+5. **Document breaking changes** - struct/signature changes need a fresh publish + migration
 
 ## Example: Adding a New Feature
 

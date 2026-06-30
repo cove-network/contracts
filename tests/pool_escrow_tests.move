@@ -18,6 +18,7 @@ module cove::pool_escrow_tests {
     const CLIENT2: address = @0x3;
     const WORKER2: address = @0x4;
     const NON_ADMIN: address = @0x99;
+    const ORCH: address = @0x055; // orchestrator (least-privilege settlement key)
 
     /// Platform fee: 250 bps = 2.5%.
     const PLATFORM_FEE_BPS: u64 = 250;
@@ -251,14 +252,14 @@ module cove::pool_escrow_tests {
 
             // Deduct 5000 from CLIENT1.
             let deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 5000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 5000, ts::ctx(&mut scenario)
             );
             assert!(deducted == 5000, 2);
             assert!(pool_escrow::client_balance(&pool, CLIENT1) == 5000, 3);
 
             // Pay WORKER1 gross 4000 (fee = 4000*250/10000 = 100, net = 3900).
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario)
             );
 
             assert!(pool_escrow::batch_total_paid(&batch) == 3900, 4);
@@ -286,6 +287,382 @@ module cove::pool_escrow_tests {
             ts::return_to_sender(&scenario, coin);
         };
 
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// HIGH-A regression: the ORCHESTRATOR key (not a full admin) must be able to
+    /// run the ENTIRE settlement flow — start, deduct_client_usage, pay_worker,
+    /// finalize. deduct_client_usage was previously is_admin-only, which made the
+    /// L1 budget (grown only by deduct) permanently unreachable by the one party
+    /// that runs settlement. This proves the orchestrator can now grow the budget.
+    #[test]
+    fun test_orchestrator_can_run_full_settlement() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        // Fund CLIENT1.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let coin = mint_cove(&mut scenario, 10000);
+            transfer::public_transfer(coin, CLIENT1);
+        };
+        ts::next_tx(&mut scenario, CLIENT1);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let payment = ts::take_from_sender<Coin<COVE_TOKEN>>(&scenario);
+            pool_escrow::deposit(&mut pool, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(pool);
+        };
+
+        // Super-admin (ADMIN) grants the least-privilege orchestrator role.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            admin_registry::add_orchestrator(&mut admin_reg, ORCH, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+        };
+
+        // ORCH (NOT an admin) runs the full settlement, INCLUDING deduct.
+        ts::next_tx(&mut scenario, ORCH);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+
+            let mut batch = pool_escrow::start_batch_settlement(
+                &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
+            );
+            // The HIGH-A fix: an orchestrator key can now debit clients.
+            let deducted = pool_escrow::deduct_client_usage(
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 5000, ts::ctx(&mut scenario)
+            );
+            assert!(deducted == 5000, 0);
+            assert!(pool_escrow::batch_budget_remaining(&batch) == 5000, 1);
+            pool_escrow::pay_worker(
+                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario)
+            );
+            pool_escrow::finalize_batch_settlement(
+                &mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario)
+            );
+            assert!(pool_escrow::total_paid_workers(&pool) == 3900, 2);
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    // =========================================================================
+    // L1 budget enforcement toggle (set_budget_enforcement)
+    // =========================================================================
+
+    /// Genesis default is OFF: pay_worker must succeed WITHOUT any prior
+    /// deduct_client_usage. This is the orchestrator's real settlement flow —
+    /// the off-chain Postgres ledger is authoritative for client balances, so
+    /// the PTB pays workers directly. budget_remaining stays 0 and is ignored.
+    #[test]
+    fun test_budget_enforcement_off_pays_without_deduct() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        // Fund the pool via a client deposit (so pool.pool can cover payouts).
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let coin = mint_cove(&mut scenario, 10000);
+            transfer::public_transfer(coin, CLIENT1);
+        };
+        ts::next_tx(&mut scenario, CLIENT1);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let payment = ts::take_from_sender<Coin<COVE_TOKEN>>(&scenario);
+            pool_escrow::deposit(&mut pool, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(pool);
+        };
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            assert!(!pool_escrow::budget_enforcement_enabled(&pool), 0);
+
+            let mut batch = pool_escrow::start_batch_settlement(
+                &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
+            );
+            // No deduct_client_usage — budget_remaining is 0 — yet this succeeds
+            // because enforcement is off.
+            pool_escrow::pay_worker(
+                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario)
+            );
+            assert!(pool_escrow::batch_total_paid(&batch) == 3900, 1);
+            pool_escrow::finalize_batch_settlement(
+                &mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario)
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// With enforcement ON, paying more gross than was debited this cycle must
+    /// abort with EBatchBudgetExceeded (value conservation).
+    #[test]
+    #[expected_failure(abort_code = pool_escrow::EBatchBudgetExceeded)]
+    fun test_budget_enforcement_on_blocks_overpay() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let coin = mint_cove(&mut scenario, 10000);
+            transfer::public_transfer(coin, CLIENT1);
+        };
+        ts::next_tx(&mut scenario, CLIENT1);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let payment = ts::take_from_sender<Coin<COVE_TOKEN>>(&scenario);
+            pool_escrow::deposit(&mut pool, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(pool);
+        };
+
+        // Super-admin (= ADMIN in test setup) enables enforcement.
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            pool_escrow::set_budget_enforcement(
+                &mut pool, &admin_reg, true, &clock, ts::ctx(&mut scenario)
+            );
+            assert!(pool_escrow::budget_enforcement_enabled(&pool), 0);
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut batch = pool_escrow::start_batch_settlement(
+                &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
+            );
+            // Debit only 1000, then try to pay 4000 gross — exceeds budget.
+            let _ = pool_escrow::deduct_client_usage(
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 1000, ts::ctx(&mut scenario)
+            );
+            pool_escrow::pay_worker(
+                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario)
+            );
+            // Unreachable.
+            pool_escrow::finalize_batch_settlement(
+                &mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario)
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// Only super-admin may toggle budget enforcement.
+    #[test]
+    #[expected_failure(abort_code = pool_escrow::ENotSuperAdmin)]
+    fun test_set_budget_enforcement_non_super_admin_fails() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        ts::next_tx(&mut scenario, NON_ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            pool_escrow::set_budget_enforcement(
+                &mut pool, &admin_reg, true, &clock, ts::ctx(&mut scenario)
+            );
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    // =========================================================================
+    // L1 rolling payout cap (set_payout_cap / EPayoutCapExceeded)
+    // =========================================================================
+
+    /// A gross payout exceeding the rolling cap must abort EPayoutCapExceeded.
+    #[test]
+    #[expected_failure(abort_code = pool_escrow::EPayoutCapExceeded)]
+    fun test_payout_cap_blocks_excessive_payout() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let coin = mint_cove(&mut scenario, 10000);
+            transfer::public_transfer(coin, CLIENT1);
+        };
+        ts::next_tx(&mut scenario, CLIENT1);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let payment = ts::take_from_sender<Coin<COVE_TOKEN>>(&scenario);
+            pool_escrow::deposit(&mut pool, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(pool);
+        };
+        // Super-admin sets a tight cap of 3000 (window unchanged).
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            pool_escrow::set_payout_cap(&mut pool, &admin_reg, 3000, 0, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut batch = pool_escrow::start_batch_settlement(&mut pool, &admin_reg, &clock, ts::ctx(&mut scenario));
+            // 4000 gross > 3000 cap → abort.
+            pool_escrow::pay_worker(&mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario));
+            pool_escrow::finalize_batch_settlement(&mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// A payout within the cap succeeds and records window usage.
+    #[test]
+    fun test_payout_cap_allows_within_and_records() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let coin = mint_cove(&mut scenario, 10000);
+            transfer::public_transfer(coin, CLIENT1);
+        };
+        ts::next_tx(&mut scenario, CLIENT1);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let payment = ts::take_from_sender<Coin<COVE_TOKEN>>(&scenario);
+            pool_escrow::deposit(&mut pool, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(pool);
+        };
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            pool_escrow::set_payout_cap(&mut pool, &admin_reg, 5000, 0, &clock, ts::ctx(&mut scenario));
+            let mut batch = pool_escrow::start_batch_settlement(&mut pool, &admin_reg, &clock, ts::ctx(&mut scenario));
+            pool_escrow::pay_worker(&mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario));
+            pool_escrow::finalize_batch_settlement(&mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario));
+            // window_used == the GROSS just paid (cap counts gross).
+            let (cap, _win, _start, used) = pool_escrow::payout_cap_status(&pool);
+            assert!(cap == 5000, 0);
+            assert!(used == 4000, 1);
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = pool_escrow::ENotSuperAdmin)]
+    fun test_set_payout_cap_non_super_admin_fails() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+        ts::next_tx(&mut scenario, NON_ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            pool_escrow::set_payout_cap(&mut pool, &admin_reg, 1000, 0, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    // =========================================================================
+    // Tunable platform fee (set_platform_fee_bps / EFeeTooHigh)
+    // =========================================================================
+
+    #[test]
+    #[expected_failure(abort_code = pool_escrow::EFeeTooHigh)]
+    fun test_set_platform_fee_bps_rejects_above_max() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // 501 bps > MAX_FEE_BPS (500) → abort.
+            pool_escrow::set_platform_fee_bps(&mut pool, &admin_reg, 501, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    /// Retuning the fee actually changes what pay_worker withholds.
+    #[test]
+    fun test_set_platform_fee_bps_retune_changes_net() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let coin = mint_cove(&mut scenario, 10000);
+            transfer::public_transfer(coin, CLIENT1);
+        };
+        ts::next_tx(&mut scenario, CLIENT1);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let payment = ts::take_from_sender<Coin<COVE_TOKEN>>(&scenario);
+            pool_escrow::deposit(&mut pool, payment, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(pool);
+        };
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            // Retune to the 5% ceiling.
+            pool_escrow::set_platform_fee_bps(&mut pool, &admin_reg, 500, &clock, ts::ctx(&mut scenario));
+            assert!(pool_escrow::platform_fee_bps(&pool) == 500, 0);
+
+            let mut batch = pool_escrow::start_batch_settlement(&mut pool, &admin_reg, &clock, ts::ctx(&mut scenario));
+            // 1000 gross @ 5% → fee 50, net 950 (vs the 25/975 at the 250 default).
+            pool_escrow::pay_worker(&mut pool, &admin_reg, &mut batch, WORKER1, 1000, &clock, ts::ctx(&mut scenario));
+            assert!(pool_escrow::batch_fees_collected(&batch) == 50, 1);
+            assert!(pool_escrow::batch_total_paid(&batch) == 950, 2);
+            pool_escrow::finalize_batch_settlement(&mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = pool_escrow::ENotSuperAdmin)]
+    fun test_set_platform_fee_bps_non_super_admin_fails() {
+        let mut scenario = setup_test();
+        let clock = create_clock(&mut scenario);
+        ts::next_tx(&mut scenario, NON_ADMIN);
+        {
+            let mut pool = ts::take_shared<EscrowPool>(&scenario);
+            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            pool_escrow::set_platform_fee_bps(&mut pool, &admin_reg, 100, &clock, ts::ctx(&mut scenario));
+            ts::return_shared(admin_reg);
+            ts::return_shared(pool);
+        };
         clock::destroy_for_testing(clock);
         ts::end(scenario);
     }
@@ -323,7 +700,7 @@ module cove::pool_escrow_tests {
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
             let _deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 100_000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 100_000, ts::ctx(&mut scenario)
             );
 
             let pool_before = pool_escrow::pool_balance(&pool);
@@ -333,7 +710,7 @@ module cove::pool_escrow_tests {
             //   fee = 10_000 * 250 / 10_000 = 250
             //   net = 10_000 - 250 = 9_750
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 10_000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 10_000, &clock, ts::ctx(&mut scenario)
             );
 
             let expected_fee = (10_000 * PLATFORM_FEE_BPS) / BPS_DENOMINATOR; // 250
@@ -351,7 +728,7 @@ module cove::pool_escrow_tests {
             //   fee = 1_000 * 250 / 10_000 = 25
             //   net = 1_000 - 25 = 975
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER2, 1_000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER2, 1_000, &clock, ts::ctx(&mut scenario)
             );
 
             assert!(pool_escrow::batch_fees_collected(&batch) == expected_fee + 25, 4);
@@ -415,12 +792,12 @@ module cove::pool_escrow_tests {
             let mut pool = ts::take_shared<EscrowPool>(&scenario);
             let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
 
-            let batch = pool_escrow::start_batch_settlement(
+            let mut batch = pool_escrow::start_batch_settlement(
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
 
             let deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 1000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 1000, ts::ctx(&mut scenario)
             );
 
             // Should only deduct 300 (the available balance), not 1000.
@@ -465,12 +842,12 @@ module cove::pool_escrow_tests {
         {
             let mut pool = ts::take_shared<EscrowPool>(&scenario);
             let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            let batch = pool_escrow::start_batch_settlement(
+            let mut batch = pool_escrow::start_batch_settlement(
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
 
             let deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 0, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 0, ts::ctx(&mut scenario)
             );
             assert!(deducted == 0, 0);
             assert!(pool_escrow::client_balance(&pool, CLIENT1) == 500, 1);
@@ -518,10 +895,10 @@ module cove::pool_escrow_tests {
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
             let _deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 2000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 2000, ts::ctx(&mut scenario)
             );
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 1000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 1000, &clock, ts::ctx(&mut scenario)
             );
 
             // batch is consumed by value -- after this call it no longer exists.
@@ -639,11 +1016,11 @@ module cove::pool_escrow_tests {
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
             let _deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 10000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 10000, ts::ctx(&mut scenario)
             );
             // Pay WORKER1 gross 8000 => fee = 200, net = 7800.
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 8000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 8000, &clock, ts::ctx(&mut scenario)
             );
             pool_escrow::finalize_batch_settlement(
                 &mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario)
@@ -817,9 +1194,13 @@ module cove::pool_escrow_tests {
         {
             let mut pool = ts::take_shared<EscrowPool>(&scenario);
             let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut batch = ts::take_from_address<SettlementBatch>(&scenario, ADMIN);
             let _deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 100, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 100, ts::ctx(&mut scenario)
             );
+            // Unreachable (deduct aborts on the admin check above); present only
+            // to satisfy the type checker that the batch resource is consumed.
+            pool_escrow::transfer_batch_for_testing(batch, ADMIN);
             ts::return_shared(admin_reg);
             ts::return_shared(pool);
         };
@@ -873,7 +1254,7 @@ module cove::pool_escrow_tests {
             let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
             let mut batch = ts::take_from_sender<SettlementBatch>(&scenario);
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 1000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 1000, &clock, ts::ctx(&mut scenario)
             );
             ts::return_to_sender(&scenario, batch);
             ts::return_shared(admin_reg);
@@ -934,14 +1315,21 @@ module cove::pool_escrow_tests {
             ts::return_shared(pool);
         };
 
-        // Try to deduct without starting settlement -- should abort.
+        // Try to deduct without starting settlement -- should abort with
+        // ENoSettlementInProgress. We fabricate a standalone batch (the only
+        // production constructor, start_batch_settlement, would flip the pool's
+        // settlement_in_progress flag true), so the pool still reports no active
+        // settlement and the defensive guard fires.
         ts::next_tx(&mut scenario, ADMIN);
         {
             let mut pool = ts::take_shared<EscrowPool>(&scenario);
             let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
+            let mut batch = pool_escrow::new_batch_for_testing(0, ts::ctx(&mut scenario));
             let _deducted = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 500, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 500, ts::ctx(&mut scenario)
             );
+            // Unreachable (deduct aborts above); consume the batch resource.
+            pool_escrow::transfer_batch_for_testing(batch, ADMIN);
             ts::return_shared(admin_reg);
             ts::return_shared(pool);
         };
@@ -1003,21 +1391,21 @@ module cove::pool_escrow_tests {
 
             // Deduct 2000 from CLIENT1, 1000 from CLIENT2.
             let d1 = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 2000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 2000, ts::ctx(&mut scenario)
             );
             let d2 = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT2, 1000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT2, 1000, ts::ctx(&mut scenario)
             );
             assert!(d1 == 2000, 1);
             assert!(d2 == 1000, 2);
 
             // Pay WORKER1 gross 1500 => fee=37, net=1463.
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 1500, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 1500, &clock, ts::ctx(&mut scenario)
             );
             // Pay WORKER2 gross 1000 => fee=25, net=975.
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER2, 1000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER2, 1000, &clock, ts::ctx(&mut scenario)
             );
 
             assert!(pool_escrow::batch_workers_paid(&batch) == 2, 3);
@@ -1152,11 +1540,11 @@ module cove::pool_escrow_tests {
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
             let _d = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 10_000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 10_000, ts::ctx(&mut scenario)
             );
             // gross 4000 => fee=100, net=3900
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER1, 4000, &clock, ts::ctx(&mut scenario)
             );
             pool_escrow::finalize_batch_settlement(
                 &mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario)
@@ -1174,11 +1562,11 @@ module cove::pool_escrow_tests {
                 &mut pool, &admin_reg, &clock, ts::ctx(&mut scenario)
             );
             let _d = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, 5000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, CLIENT1, 5000, ts::ctx(&mut scenario)
             );
             // gross 2000 => fee=50, net=1950
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER2, 2000, ts::ctx(&mut scenario)
+                &mut pool, &admin_reg, &mut batch, WORKER2, 2000, &clock, ts::ctx(&mut scenario)
             );
             pool_escrow::finalize_batch_settlement(
                 &mut pool, &admin_reg, batch, &clock, ts::ctx(&mut scenario)
@@ -1273,10 +1661,10 @@ module cove::pool_escrow_tests {
                 &mut pool, &admin_reg, clock, ts::ctx(scenario),
             );
             let _ = pool_escrow::deduct_client_usage(
-                &mut pool, &admin_reg, CLIENT1, gross_worker, ts::ctx(scenario),
+                &mut pool, &admin_reg, &mut batch, CLIENT1, gross_worker, ts::ctx(scenario),
             );
             pool_escrow::pay_worker(
-                &mut pool, &admin_reg, &mut batch, WORKER1, gross_worker, ts::ctx(scenario),
+                &mut pool, &admin_reg, &mut batch, WORKER1, gross_worker, clock, ts::ctx(scenario),
             );
             pool_escrow::finalize_batch_settlement(
                 &mut pool, &admin_reg, batch, clock, ts::ctx(scenario),

@@ -33,6 +33,7 @@ module cove::admin_registry {
     use sui::table::{Self, Table};
     use sui::vec_set::{Self, VecSet};
     use sui::clock::{Self, Clock};
+    use sui::bag::{Self, Bag};
     use sui::event;
 
     // ===  Error Codes ===
@@ -90,6 +91,11 @@ module cove::admin_registry {
         /// are NOT admins -- they only pass `is_admin_or_orchestrator` gates. A small set,
         /// so a `VecSet` keeps membership + listing cheap and simple.
         orchestrators: VecSet<address>,
+        /// Forward-compat: future role tiers / per-role policy attach here as a
+        /// compatible upgrade — NEVER add struct fields post-publish (this is the
+        /// keystone object every module depends on; a republish of it is the most
+        /// expensive). Keyed by a `vector<u8>` name. See contracts/UPGRADE.md.
+        config: Bag,
     }
 
     /// Metadata attached to each regular admin entry.
@@ -156,6 +162,7 @@ module cove::admin_registry {
             admins: table::new(ctx),
             admin_count: 0,
             orchestrators: vec_set::empty(),
+            config: bag::new(ctx),
         };
 
         transfer::share_object(registry);

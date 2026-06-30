@@ -57,6 +57,7 @@ module cove::treasury {
     use sui::balance::{Self, Balance};
     use sui::clock::{Self, Clock};
     use sui::table::{Self, Table};
+    use sui::bag::{Self, Bag};
     use sui::event;
     use cove::cove_token::COVE_TOKEN;
     use cove::admin_registry::{Self, AdminRegistry};
@@ -109,11 +110,6 @@ module cove::treasury {
     /// Platform fee in basis points: 2.5% = 250/10000.
     const PLATFORM_FEE_BPS: u64 = 250;
     const BPS_DENOMINATOR: u64 = 10000;
-
-    // ─── Vesting configuration ──────────────────────────────────────────────
-
-    /// 4 years in milliseconds (4 × 365.25 × 86400 × 1000).
-    const TEAM_VESTING_DURATION_MS: u64 = 126_230_400_000;
 
     // ─── Withdrawal cap defaults ────────────────────────────────────────────
     //
@@ -201,6 +197,10 @@ module cove::treasury {
 
         /// Guard flag set to `true` once `initialize_distribution` completes.
         initialized: bool,
+        /// Forward-compat: future treasury state (new pools, cap dimensions,
+        /// staking sub-balances) attaches here as a compatible upgrade — never
+        /// add struct fields post-publish. See contracts/UPGRADE.md.
+        config: Bag,
     }
 
     /// Linear vesting schedule for a single beneficiary. Shared so anyone can
@@ -215,6 +215,11 @@ module cove::treasury {
         duration: u64,
         cliff_duration: u64,
         balance: Balance<COVE_TOKEN>,
+        /// Forward-compat: a schedule lives for years, so future per-grant state
+        /// (revocability, cliff acceleration, transfer-on-departure, metadata)
+        /// attaches here as a compatible upgrade — never a struct-field add. The
+        /// object is never deleted, so this bag is never destroyed.
+        config: Bag,
     }
 
     /// Maps beneficiary → VestingSchedule ID. Enforces one-schedule-per-beneficiary.
@@ -222,6 +227,9 @@ module cove::treasury {
         id: UID,
         version: u64,
         schedules: Table<address, ID>,
+        /// Forward-compat: future registry-level state attaches here (permanent
+        /// singleton, bag never destroyed). See contracts/UPGRADE.md.
+        config: Bag,
     }
 
     // ─── Events ──────────────────────────────────────────────────────────────
@@ -328,12 +336,14 @@ module cove::treasury {
             fee_window_used: 0,
 
             initialized: false,
+            config: bag::new(ctx),
         };
 
         let registry = VestingRegistry {
             id: object::new(ctx),
             version: VERSION,
             schedules: table::new(ctx),
+            config: bag::new(ctx),
         };
 
         transfer::share_object(treasury);
@@ -440,13 +450,25 @@ module cove::treasury {
         beneficiary: address,
         amount: u64,
         cliff_duration: u64,
+        vesting_duration: u64,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
         assert!(treasury.version == VERSION, EWrongVersion);
         assert!(registry.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
+        // SUPER-ADMIN only. This splits up to the whole team_pool (2.5B COVE) out
+        // to an arbitrary beneficiary with an arbitrary (possibly instant) vest,
+        // is NOT subject to the per-pool withdrawal caps, and has no clawback — so
+        // it's a discretionary fund-moving action and belongs at the same tier as
+        // move_between_pools / the cap setters / migrate, NOT plain is_admin. (A
+        // regular admin must never be able to drain the team pool.)
+        assert!(admin_registry::is_super_admin(admin_reg, tx_context::sender(ctx)), ENotSuperAdmin);
         assert!(amount > 0, EInvalidAmount);
+        // vesting_duration is a per-call param now (was a baked 4yr const), so a
+        // new grant can have any schedule without a republish. L3 invariant: a
+        // cliff longer than the total vest is broken (it'd all unlock at once).
+        assert!(vesting_duration > 0, EInvalidAmount);
+        assert!(cliff_duration <= vesting_duration, EInvalidAmount);
         assert!(balance::value(&treasury.team_pool) >= amount, EInsufficientBalance);
         assert!(!table::contains(&registry.schedules, beneficiary), EVestingAlreadyExists);
 
@@ -460,9 +482,10 @@ module cove::treasury {
             total_amount: amount,
             released_amount: 0,
             start_time: now,
-            duration: TEAM_VESTING_DURATION_MS,
+            duration: vesting_duration,
             cliff_duration,
             balance: vesting_balance,
+            config: bag::new(ctx),
         };
         let schedule_id = object::id(&schedule);
 
@@ -473,7 +496,7 @@ module cove::treasury {
             schedule_id,
             amount,
             start_time: now,
-            duration: TEAM_VESTING_DURATION_MS,
+            duration: vesting_duration,
             cliff_duration,
         });
 
@@ -1124,11 +1147,13 @@ module cove::treasury {
             fee_window_used: 0,
 
             initialized: false,
+            config: bag::new(ctx),
         };
         let registry = VestingRegistry {
             id: object::new(ctx),
             version: VERSION,
             schedules: table::new(ctx),
+            config: bag::new(ctx),
         };
         transfer::share_object(treasury);
         transfer::share_object(registry);
