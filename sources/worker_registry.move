@@ -12,8 +12,8 @@
 ///   - `register()` is admin-gated and takes the worker's wallet as a parameter
 ///     (v2 onwards). The orchestrator signs registrations on behalf of newly-
 ///     connected agents — operators never expose a wallet private key on a box.
-///     `update_worker_tier`, `record_job_completion`, suspend/ban/deregister are
-///     all already admin-gated, so register joins the same trust model.
+///     `update_worker_tier`, suspend/ban/deregister are all already
+///     admin-gated, so register joins the same trust model.
 ///   - No on-chain staking. The orchestrator verifies each worker's COVE balance off-chain
 ///     (hourly) and calls `update_worker_tier()` to reflect the result on-chain. This avoids
 ///     locking user funds while still gating participation on economic commitment.
@@ -27,7 +27,6 @@
 ///   - `active_workers` is maintained as an explicit counter that is incremented/decremented
 ///     at every status transition. Earlier versions derived this count lazily, which caused
 ///     drift when workers were suspended or deregistered while active.
-///   - Reputation uses saturating arithmetic to avoid u8 underflow (0 - 5 would abort).
 ///   - All shared objects carry a `version` field checked against the package constant so
 ///     that stale transactions fail cleanly after a package upgrade.
 module cove::worker_registry {
@@ -58,9 +57,6 @@ module cove::worker_registry {
     /// function. (For now only set_tier_thresholds; we treat ENotAdmin
     /// as the regular-admin gate and ENotSuperAdmin as stricter.)
     const ENotSuperAdmin: u64 = 9;
-    /// set_reputation_params given rep_start > rep_max (a worker can't start
-    /// above the ceiling).
-    const EInvalidReputationParams: u64 = 10;
 
     // ============================ Version Gate ===============================
 
@@ -69,11 +65,6 @@ module cove::worker_registry {
     /// v2 (2026-05-28): multi-node-per-wallet redesign — registry re-keyed
     /// on (wallet, node_id), register is admin-gated, Worker gains node_id.
     const VERSION: u64 = 2;
-
-    // ======================== Overflow Protection ============================
-
-    /// Maximum value for u64, used for saturating arithmetic on lifetime counters.
-    const MAX_U64: u64 = 18_446_744_073_709_551_615;
 
     // ===================== Tier Balance Requirements ========================
     // Thresholds use 9 decimal places (COVE smallest unit).
@@ -155,15 +146,6 @@ module cove::worker_registry {
         gold_threshold: u64,
         platinum_threshold: u64,
 
-        // ─── Tunable reputation policy ──────────────────────────────
-        // Behavioral dials, retunable as we observe gaming. Reputation is
-        // advisory-only (off-chain routing reads it), so ADMIN (operational),
-        // not super-admin. u8 scores in [0, rep_max].
-        rep_start: u8,            // starting reputation for a new worker
-        rep_success_delta: u8,    // +rep per successful job (capped at rep_max)
-        rep_failure_penalty: u8,  // -rep per failed job (floor 0)
-        rep_max: u8,              // ceiling
-
         /// Forward-compat: future registry-level state attaches here as a
         /// compatible upgrade — never add struct fields post-publish. New
         /// orchestrator-driven entry points use the `_v2` add-a-function
@@ -176,8 +158,7 @@ module cove::worker_registry {
     /// both the worker and the admin/orchestrator can mutate it.
     ///
     /// The orchestrator updates `tier`, `verified_balance`, and `last_verified`
-    /// periodically (roughly hourly). Job stats and reputation are updated by
-    /// the orchestrator when a job completes.
+    /// periodically (roughly hourly).
     public struct Worker has key, store {
         id: UID,
         /// Must equal `VERSION`; checked on capability updates.
@@ -202,17 +183,6 @@ module cove::worker_registry {
         verified_balance: u64,
         /// Epoch-millis timestamp when the worker called `register()`.
         registered_at: u64,
-        /// Cumulative number of transcoding jobs completed (success or failure).
-        jobs_completed: u64,
-        /// Cumulative minutes of media processed across all jobs.
-        minutes_processed: u64,
-        /// Cumulative COVE earned across all jobs (with 9 decimals).
-        total_earnings: u64,
-        /// Reputation score, clamped to [0, registry.rep_max]. The start value,
-        /// per-success delta, per-failure penalty, and max are all TUNABLE on the
-        /// WorkerRegistry (set_reputation_params); genesis defaults are start 50,
-        /// +1/success, -5/failure, max 100.
-        reputation: u8,
         /// Self-reported hardware profile used for job matching.
         capabilities: WorkerCapabilities,
         /// Forward-compat: future per-node state (SLA counters, new capability
@@ -227,7 +197,7 @@ module cove::worker_registry {
     /// The orchestrator uses these fields to match incoming transcode jobs to
     /// workers that can handle them (e.g. AV1 encode requires a capable GPU).
     /// Values are not validated on-chain; dishonest reporting leads to job
-    /// failures which hurt the worker's reputation score.
+    /// failures that the orchestrator tracks off-chain.
     public struct WorkerCapabilities has store, copy, drop {
         /// GPU vendor: 0 = None, 1 = NVIDIA, 2 = AMD, 3 = Intel.
         gpu_type: u8,
@@ -288,14 +258,6 @@ module cove::worker_registry {
         removed_by: address,
     }
 
-    /// Emitted when the orchestrator records a completed job for a worker.
-    public struct JobCompleted has copy, drop {
-        worker: address,
-        node_id: vector<u8>,
-        minutes: u64,
-        earnings: u64,
-    }
-
     /// Emitted on `set_tier_thresholds`. Tier thresholds are global —
     /// changing them re-tiers every worker on their next
     /// `update_tier_and_balance` call (orchestrator runs this hourly).
@@ -330,10 +292,6 @@ module cove::worker_registry {
             silver_threshold:   SILVER_REQUIREMENT,
             gold_threshold:     GOLD_REQUIREMENT,
             platinum_threshold: PLATINUM_REQUIREMENT,
-            rep_start: 50,
-            rep_success_delta: 1,
-            rep_failure_penalty: 5,
-            rep_max: 100,
             config: bag::new(ctx),
         };
 
@@ -415,10 +373,6 @@ module cove::worker_registry {
             last_verified: 0,
             verified_balance: 0,
             registered_at: timestamp,
-            jobs_completed: 0,
-            minutes_processed: 0,
-            total_earnings: 0,
-            reputation: registry.rep_start,
             capabilities,
             config: bag::new(ctx),
         };
@@ -514,104 +468,6 @@ module cove::worker_registry {
                 verified_balance,
             });
         };
-    }
-
-    /// Record the outcome of a completed transcoding job for a worker.
-    ///
-    /// Called by the orchestrator/admin after a job finishes (successfully or not).
-    /// Workers cannot call this themselves -- the orchestrator is the source of
-    /// truth for job outcomes to prevent workers from inflating their own stats.
-    ///
-    /// Reputation update rules (asymmetric to penalize failures heavily), all
-    /// TUNABLE via set_reputation_params (genesis defaults shown):
-    ///   - Success: + rep_success_delta (default 1), capped at rep_max (default 100)
-    ///   - Failure: - rep_failure_penalty (default 5), floored at 0 (saturating)
-    ///
-    /// The saturating subtraction is critical: `reputation` is u8, so a naive
-    /// `reputation - 5` would abort with arithmetic underflow if reputation < 5.
-    ///
-    /// Lifetime counters (`jobs_completed`, `minutes_processed`, `total_earnings`)
-    /// use saturating addition to prevent u64 overflow on extremely long-running
-    /// workers.
-    ///
-    /// Caller: admin/orchestrator only.
-    ///
-    /// Side effects:
-    ///   - Increments `jobs_completed`, `minutes_processed`, `total_earnings`.
-    ///   - Adjusts `reputation`.
-    ///   - Emits `JobCompleted`.
-    public fun record_job_completion(
-        registry: &WorkerRegistry,
-        admin_reg: &AdminRegistry,
-        worker: &mut Worker,
-        minutes: u64,
-        earnings: u64,
-        success: bool,
-        ctx: &TxContext
-    ) {
-        assert!(registry.version == VERSION, EWrongVersion);
-        assert!(worker.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
-
-        // Saturating add for lifetime counters to prevent u64 overflow
-        if (worker.jobs_completed < MAX_U64) {
-            worker.jobs_completed = worker.jobs_completed + 1;
-        };
-        if (worker.minutes_processed <= MAX_U64 - minutes) {
-            worker.minutes_processed = worker.minutes_processed + minutes;
-        } else {
-            worker.minutes_processed = MAX_U64;
-        };
-        if (worker.total_earnings <= MAX_U64 - earnings) {
-            worker.total_earnings = worker.total_earnings + earnings;
-        } else {
-            worker.total_earnings = MAX_U64;
-        };
-
-        // Reputation: +rep_success_delta on success (capped at rep_max),
-        // -rep_failure_penalty on failure (floor 0). Tunable via
-        // set_reputation_params. u64 intermediate avoids u8 overflow on the add.
-        if (success) {
-            let inc = (worker.reputation as u64) + (registry.rep_success_delta as u64);
-            let cap = (registry.rep_max as u64);
-            worker.reputation = (if (inc > cap) { cap } else { inc }) as u8;
-        } else {
-            worker.reputation = if (worker.reputation >= registry.rep_failure_penalty) {
-                worker.reputation - registry.rep_failure_penalty
-            } else {
-                0
-            };
-        };
-
-        event::emit(JobCompleted {
-            worker: worker.wallet,
-            node_id: worker.node_id,
-            minutes,
-            earnings,
-        });
-    }
-
-    /// Retune the reputation policy. ADMIN (operational dial — reputation is
-    /// advisory-only off-chain routing, not a value/security path), not
-    /// super-admin. Invariant: rep_start <= rep_max (a worker can't start above
-    /// the ceiling). This is a behavioral dial you'll want to A/B as you observe
-    /// gaming — changeable without a republish.
-    public fun set_reputation_params(
-        registry: &mut WorkerRegistry,
-        admin_reg: &AdminRegistry,
-        rep_start: u8,
-        rep_success_delta: u8,
-        rep_failure_penalty: u8,
-        rep_max: u8,
-        ctx: &TxContext
-    ) {
-        assert!(registry.version == VERSION, EWrongVersion);
-        assert!(admin_registry::is_admin(admin_reg, tx_context::sender(ctx)), ENotAdmin);
-        assert!(rep_start <= rep_max, EInvalidReputationParams);
-        registry.rep_start = rep_start;
-        registry.rep_success_delta = rep_success_delta;
-        registry.rep_failure_penalty = rep_failure_penalty;
-        registry.rep_max = rep_max;
     }
 
     // ====================== Capability Updates ==============================
@@ -855,10 +711,6 @@ module cove::worker_registry {
             last_verified: _,
             verified_balance: _,
             registered_at: _,
-            jobs_completed: _,
-            minutes_processed: _,
-            total_earnings: _,
-            reputation: _,
             capabilities: _,
             config,
         } = worker;
@@ -1019,22 +871,6 @@ module cove::worker_registry {
         worker.status
     }
 
-    public fun worker_reputation(worker: &Worker): u8 {
-        worker.reputation
-    }
-
-    public fun worker_jobs_completed(worker: &Worker): u64 {
-        worker.jobs_completed
-    }
-
-    public fun worker_minutes_processed(worker: &Worker): u64 {
-        worker.minutes_processed
-    }
-
-    public fun worker_total_earnings(worker: &Worker): u64 {
-        worker.total_earnings
-    }
-
     public fun worker_capabilities(worker: &Worker): &WorkerCapabilities {
         &worker.capabilities
     }
@@ -1124,7 +960,6 @@ module cove::worker_registry {
     ///
     /// Caller: super admin only (version migrations follow package upgrades).
     public fun migrate_worker(
-        registry: &WorkerRegistry,
         admin_reg: &AdminRegistry,
         worker: &mut Worker,
         ctx: &TxContext

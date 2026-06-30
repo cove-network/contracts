@@ -339,9 +339,9 @@ module cove::presale_tests {
             ts::return_shared(registry);
         };
 
-        // NOTE: Attempting to buy again in the same stage would abort with
-        // EExceedsWalletLimit. That case is covered by
-        // test_wallet_limit_aborts_when_exceeded.
+        // NOTE: Buying again in the same stage past the per-wallet cap is
+        // capped-and-refunded (not aborted). That case is covered by
+        // test_wallet_limit_refunds_after_cap_reached.
 
         clock::destroy_for_testing(clock);
         ts::end(scenario);

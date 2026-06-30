@@ -93,7 +93,7 @@ module cove::worker_registry_tests {
     // ========================== Test Cases ===================================
 
     // -----------------------------------------------------------------
-    // 1. Register a worker -- starts inactive, tier none, reputation 50
+    // 1. Register a worker -- starts inactive, tier none
     // -----------------------------------------------------------------
     #[test]
     fun test_register_worker() {
@@ -117,10 +117,6 @@ module cove::worker_registry_tests {
 
             assert!(worker_registry::worker_tier(&worker) == worker_registry::tier_none(), 4);
             assert!(worker_registry::worker_status(&worker) == worker_registry::status_inactive(), 5);
-            assert!(worker_registry::worker_reputation(&worker) == 50, 6);
-            assert!(worker_registry::worker_jobs_completed(&worker) == 0, 7);
-            assert!(worker_registry::worker_minutes_processed(&worker) == 0, 8);
-            assert!(worker_registry::worker_total_earnings(&worker) == 0, 9);
             assert!(worker_registry::worker_wallet(&worker) == WORKER1, 10);
 
             ts::return_shared(registry);
@@ -270,140 +266,6 @@ module cove::worker_registry_tests {
             assert!(worker_registry::worker_tier(&worker) == worker_registry::tier_none(), 2);
             assert!(worker_registry::worker_status(&worker) == worker_registry::status_inactive(), 3);
             assert!(worker_registry::active_workers(&registry) == 0, 4);
-
-            ts::return_shared(registry);
-            ts::return_shared(admin_reg);
-            ts::return_shared(worker);
-        };
-
-        ts::end(scenario);
-    }
-
-    // -----------------------------------------------------------------
-    // 5a. record_job_completion: success adds +1 reputation
-    // -----------------------------------------------------------------
-    #[test]
-    fun test_record_job_success_increases_reputation() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-
-        ts::next_tx(&mut scenario, ADMIN);
-        register_node(&mut scenario, WORKER1, node_a());
-
-        // Record a successful job
-        ts::next_tx(&mut scenario, ADMIN);
-        {
-            let registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            let mut worker = ts::take_shared<Worker>(&scenario);
-
-            worker_registry::record_job_completion(
-                &registry,
-                &admin_reg,
-                &mut worker,
-                10,     // minutes
-                1000,   // earnings
-                true,   // success
-                ts::ctx(&mut scenario),
-            );
-
-            assert!(worker_registry::worker_reputation(&worker) == 51, 0); // 50 + 1
-            assert!(worker_registry::worker_jobs_completed(&worker) == 1, 1);
-            assert!(worker_registry::worker_minutes_processed(&worker) == 10, 2);
-            assert!(worker_registry::worker_total_earnings(&worker) == 1000, 3);
-
-            ts::return_shared(registry);
-            ts::return_shared(admin_reg);
-            ts::return_shared(worker);
-        };
-
-        ts::end(scenario);
-    }
-
-    // -----------------------------------------------------------------
-    // 5b. record_job_completion: failure subtracts 5 reputation
-    // -----------------------------------------------------------------
-    #[test]
-    fun test_record_job_failure_decreases_reputation() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-
-        ts::next_tx(&mut scenario, ADMIN);
-        register_node(&mut scenario, WORKER1, node_a());
-
-        ts::next_tx(&mut scenario, ADMIN);
-        {
-            let registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            let mut worker = ts::take_shared<Worker>(&scenario);
-
-            worker_registry::record_job_completion(
-                &registry,
-                &admin_reg,
-                &mut worker,
-                5, 0, false,
-                ts::ctx(&mut scenario),
-            );
-
-            assert!(worker_registry::worker_reputation(&worker) == 45, 0); // 50 - 5
-            assert!(worker_registry::worker_jobs_completed(&worker) == 1, 1);
-
-            ts::return_shared(registry);
-            ts::return_shared(admin_reg);
-            ts::return_shared(worker);
-        };
-
-        ts::end(scenario);
-    }
-
-    // -----------------------------------------------------------------
-    // 5c. record_job_completion: reputation saturates at 0
-    // -----------------------------------------------------------------
-    #[test]
-    fun test_record_job_failure_reputation_saturates_at_zero() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-
-        ts::next_tx(&mut scenario, ADMIN);
-        register_node(&mut scenario, WORKER1, node_a());
-
-        // Drive reputation from 50 down to 0 across 10 failures, then one more.
-        let mut i = 0;
-        while (i < 10) {
-            ts::next_tx(&mut scenario, ADMIN);
-            {
-                let registry = ts::take_shared<WorkerRegistry>(&scenario);
-                let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-                let mut worker = ts::take_shared<Worker>(&scenario);
-
-                worker_registry::record_job_completion(
-                    &registry, &admin_reg, &mut worker,
-                    1, 0, false,
-                    ts::ctx(&mut scenario),
-                );
-
-                ts::return_shared(registry);
-                ts::return_shared(admin_reg);
-                ts::return_shared(worker);
-            };
-            i = i + 1;
-        };
-
-        // Reputation is now 0. One more failure must stay at 0, not underflow.
-        ts::next_tx(&mut scenario, ADMIN);
-        {
-            let registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            let mut worker = ts::take_shared<Worker>(&scenario);
-
-            worker_registry::record_job_completion(
-                &registry, &admin_reg, &mut worker,
-                1, 0, false,
-                ts::ctx(&mut scenario),
-            );
-
-            assert!(worker_registry::worker_reputation(&worker) == 0, 0);
-            assert!(worker_registry::worker_jobs_completed(&worker) == 11, 1);
 
             ts::return_shared(registry);
             ts::return_shared(admin_reg);
@@ -912,36 +774,6 @@ module cove::worker_registry_tests {
             worker_registry::update_worker_tier(
                 &mut registry, &admin_reg, &mut worker,
                 BRONZE_REQUIREMENT, TIMESTAMP + 3600,
-                ts::ctx(&mut scenario),
-            );
-            ts::return_shared(registry);
-            ts::return_shared(admin_reg);
-            ts::return_shared(worker);
-        };
-
-        ts::end(scenario);
-    }
-
-    // -----------------------------------------------------------------
-    // 13b. Non-admin cannot call record_job_completion
-    // -----------------------------------------------------------------
-    #[test]
-    #[expected_failure(abort_code = worker_registry::ENotAdmin)]
-    fun test_non_admin_cannot_record_job() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-
-        ts::next_tx(&mut scenario, ADMIN);
-        register_node(&mut scenario, WORKER1, node_a());
-
-        ts::next_tx(&mut scenario, WORKER1);
-        {
-            let registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            let mut worker = ts::take_shared<Worker>(&scenario);
-            worker_registry::record_job_completion(
-                &registry, &admin_reg, &mut worker,
-                10, 1000, true,
                 ts::ctx(&mut scenario),
             );
             ts::return_shared(registry);
@@ -1494,73 +1326,6 @@ module cove::worker_registry_tests {
             ts::return_shared(worker);
         };
 
-        ts::end(scenario);
-    }
-
-    // ======================== set_reputation_params ==========================
-    // Tunable reputation curve (admin-gated). Genesis defaults: start 50,
-    // +1/success, -5/failure, max 100.
-
-    /// Retuned starting reputation applies to newly-registered workers.
-    #[test]
-    fun test_set_reputation_params_applies_to_new_workers() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-
-        ts::next_tx(&mut scenario, ADMIN);
-        {
-            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            // start 70, +2/success, -10/failure, max 90.
-            worker_registry::set_reputation_params(&mut registry, &admin_reg, 70, 2, 10, 90, ts::ctx(&mut scenario));
-            ts::return_shared(admin_reg);
-            ts::return_shared(registry);
-        };
-
-        ts::next_tx(&mut scenario, ADMIN);
-        register_node(&mut scenario, WORKER1, node_a());
-
-        ts::next_tx(&mut scenario, ADMIN);
-        {
-            let worker = ts::take_shared<Worker>(&scenario);
-            // New worker starts at the retuned 70, not the genesis 50.
-            assert!(worker_registry::worker_reputation(&worker) == 70, 0);
-            ts::return_shared(worker);
-        };
-        ts::end(scenario);
-    }
-
-    /// rep_start > rep_max is rejected (invariant guard).
-    #[test]
-    #[expected_failure(abort_code = worker_registry::EInvalidReputationParams)]
-    fun test_set_reputation_params_rejects_start_above_max() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-        ts::next_tx(&mut scenario, ADMIN);
-        {
-            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            worker_registry::set_reputation_params(&mut registry, &admin_reg, 60, 1, 5, 50, ts::ctx(&mut scenario));
-            ts::return_shared(admin_reg);
-            ts::return_shared(registry);
-        };
-        ts::end(scenario);
-    }
-
-    /// A non-admin (no orchestrator, no admin) cannot retune reputation.
-    #[test]
-    #[expected_failure(abort_code = worker_registry::ENotAdmin)]
-    fun test_set_reputation_params_non_admin_fails() {
-        let mut scenario = ts::begin(ADMIN);
-        setup_registry(&mut scenario);
-        ts::next_tx(&mut scenario, STRANGER);
-        {
-            let mut registry = ts::take_shared<WorkerRegistry>(&scenario);
-            let admin_reg = ts::take_shared<AdminRegistry>(&scenario);
-            worker_registry::set_reputation_params(&mut registry, &admin_reg, 50, 1, 5, 100, ts::ctx(&mut scenario));
-            ts::return_shared(admin_reg);
-            ts::return_shared(registry);
-        };
         ts::end(scenario);
     }
 

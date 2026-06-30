@@ -19,8 +19,7 @@
 ///
 ///    ```
 ///    start_batch_settlement()          -- Lock the pool, create a SettlementBatch
-///      -> deduct_client_usage()  x N   -- Debit each client's ledger balance
-///      -> pay_worker()           x M   -- Pay each worker (minus 2.5% platform fee)
+///      -> pay_worker()           x M   -- Pay each worker (minus the platform fee)
 ///    finalize_batch_settlement()       -- Unlock the pool, record stats
 ///    ```
 ///
@@ -94,8 +93,6 @@ module cove::pool_escrow {
     const EAdminWithdrawalCapExceeded: u64 = 10;
     /// set_platform_fee_bps was given a value above MAX_FEE_BPS.
     const EFeeTooHigh: u64 = 11;
-    /// pay_worker payout would exceed this batch's budget (sum of client debits).
-    const EBatchBudgetExceeded: u64 = 12;
     /// pay_worker payout would push the rolling window past the payout cap.
     const EPayoutCapExceeded: u64 = 13;
 
@@ -151,7 +148,8 @@ module cove::pool_escrow {
         /// Aggregate balance of all client deposits (minus withdrawals and payouts).
         pool: Balance<COVE_TOKEN>,
         /// Per-client balance ledger. Maps client address -> available COVE amount.
-        /// Updated on deposit, withdraw, and deduct_client_usage.
+        /// Updated on deposit and withdraw. (Off-chain Postgres is authoritative
+        /// for per-job usage; the chain only tracks deposits/withdrawals.)
         client_balances: Table<address, u64>,
         /// Platform fees withheld from worker payments, pending admin withdrawal.
         fee_pool: Balance<COVE_TOKEN>,
@@ -194,9 +192,7 @@ module cove::pool_escrow {
         // Bounds COVE leaving the pool to workers per rolling window. 0 = the
         // cap is DISABLED (unlimited). >0 = enforced. Super-admin tunes via
         // `set_payout_cap`. Distinct from fee_cap so the two flows are bounded
-        // independently. The per-batch budget (SettlementBatch.budget_remaining)
-        // is the other half of L1 — payouts also can't exceed what clients were
-        // actually debited this cycle.
+        // independently.
         /// Max worker payout per window. 0 = disabled.
         payout_cap: u64,
         /// Rolling-window length for the payout cap.
@@ -210,17 +206,6 @@ module cove::pool_escrow {
         /// via `set_platform_fee_bps` (super-admin, ≤ MAX_FEE_BPS). Seeded from
         /// DEFAULT_PLATFORM_FEE_BPS at genesis.
         platform_fee_bps: u64,
-
-        /// L1 value-conservation switch. When TRUE, `pay_worker` asserts each
-        /// gross payout against `SettlementBatch.budget_remaining` (grown only by
-        /// `deduct_client_usage`), so total payouts can't exceed total client
-        /// debits in a cycle. Defaults FALSE at genesis because the orchestrator
-        /// settlement PTB does not yet call `deduct_client_usage` (the off-chain
-        /// Postgres ledger is authoritative for client balances) — flipping it on
-        /// before that wiring would brick every settlement. Super-admin enables it
-        /// via `set_budget_enforcement` once the orchestrator debits per client.
-        /// The rolling `payout_cap` is independent and works regardless.
-        enforce_settlement_budget: bool,
 
         /// Forward-compat: future pool-level state (new caps, fee tiers, flags)
         /// attaches here as a compatible upgrade — NEVER add struct fields after
@@ -242,12 +227,6 @@ module cove::pool_escrow {
         cycle: u64,
         /// Timestamp (ms) when start_batch_settlement was called.
         started_at: u64,
-        /// L1 per-batch budget: accumulated from client debits via
-        /// `deduct_client_usage`, decremented by each `pay_worker`'s gross
-        /// amount. Total payouts therefore cannot exceed total debits this
-        /// cycle (value conservation) — a compromised settlement key can't pay
-        /// workers out of clients who weren't charged.
-        budget_remaining: u64,
         /// Running total of net COVE paid to workers in this batch.
         total_paid: u64,
         /// Running total of platform fees collected in this batch.
@@ -344,11 +323,6 @@ module cove::pool_escrow {
         timestamp: u64,
     }
 
-    /// Emitted when super-admin toggles L1 budget enforcement.
-    public struct BudgetEnforcementUpdated has copy, drop {
-        enabled: bool,
-        timestamp: u64,
-    }
 
     // =========================================================================
     // Initialization
@@ -386,9 +360,6 @@ module cove::pool_escrow {
             payout_window_used: 0,
 
             platform_fee_bps: DEFAULT_PLATFORM_FEE_BPS,
-            // Off at genesis — see the field doc. Super-admin flips it on once
-            // the orchestrator debits per client in the settlement PTB.
-            enforce_settlement_budget: false,
             config: bag::new(ctx),
         };
 
@@ -505,7 +476,7 @@ module cove::pool_escrow {
     /// Withdraw unused COVE from the pool back to the caller's wallet.
     ///
     /// Blocked while a settlement is in progress to prevent race conditions with
-    /// `deduct_client_usage` (which may be debiting the same client's balance).
+    /// the pool accounting that settlement mutates.
     ///
     /// **Caller**: Any client with a positive ledger balance.
     /// **Preconditions**: No active settlement, sufficient balance, pool version matches.
@@ -521,7 +492,7 @@ module cove::pool_escrow {
         ctx: &mut TxContext
     ) {
         assert!(pool.version == VERSION, EWrongVersion);
-        // Block withdrawals during settlement to avoid races with deduct_client_usage
+        // Block withdrawals during settlement to avoid races with payout accounting
         assert!(!pool.settlement_in_progress, ESettlementInProgress);
 
         let client = tx_context::sender(ctx);
@@ -558,9 +529,8 @@ module cove::pool_escrow {
     //
     // Settlement lifecycle:
     //   1. start_batch_settlement()       -- lock the pool, create batch
-    //   2. deduct_client_usage() x N      -- debit client ledger balances
-    //   3. pay_worker() x M               -- pay workers, withhold platform fees
-    //   4. finalize_batch_settlement()    -- unlock the pool, record stats
+    //   2. pay_worker() x M               -- pay workers, withhold platform fees
+    //   3. finalize_batch_settlement()    -- unlock the pool, record stats
     //
     // If anything fails mid-flight, call abort_settlement() to roll back.
 
@@ -598,74 +568,12 @@ module cove::pool_escrow {
             version: VERSION,
             cycle: pool.current_cycle,
             started_at: timestamp,
-            budget_remaining: 0, // accumulated by deduct_client_usage
             total_paid: 0,
             fees_collected: 0,
             workers_paid: 0,
             finalized: false,
             config: bag::new(ctx),
         }
-    }
-
-    /// Debit a client's ledger balance for jobs completed during this cycle.
-    ///
-    /// The orchestrator calls this once per client who owes payment. The `amount`
-    /// parameter should be the total cost of all jobs completed by this client
-    /// since the last settlement.
-    ///
-    /// **Graceful degradation**: If the client's balance is less than the requested
-    /// amount, only the available balance is deducted (no revert). The orchestrator
-    /// should validate balances off-chain beforehand; this is a safety net.
-    ///
-    /// **Returns**: The amount actually deducted. If this is less than `amount`,
-    /// the client had insufficient balance and the orchestrator should account
-    /// for the shortfall.
-    ///
-    /// **Caller**: Admin only, during an active settlement.
-    /// **Preconditions**: Settlement in progress, client exists in ledger, pool version matches.
-    /// **Side effects**: Reduces the client's entry in `client_balances`.
-    public fun deduct_client_usage(
-        pool: &mut EscrowPool,
-        admin_reg: &AdminRegistry,
-        batch: &mut SettlementBatch,
-        client: address,
-        amount: u64,
-        ctx: &TxContext
-    ): u64 {
-        assert!(pool.version == VERSION, EWrongVersion);
-        assert!(batch.version == VERSION, EWrongVersion);
-        // Orchestrator-allowed: this is part of the settlement run-path, same as
-        // start/pay/finalize. It MUST accept the orchestrator key — otherwise the
-        // only party that runs settlement could never grow `budget_remaining`,
-        // making L1 budget enforcement (set_budget_enforcement) permanently
-        // unreachable. Debiting a client's own ledger balance moves no funds out
-        // of the pool, so this is no more privileged than pay_worker.
-        assert!(admin_registry::is_admin_or_orchestrator(admin_reg, tx_context::sender(ctx)), ENotAdmin);
-        assert!(pool.settlement_in_progress, ENoSettlementInProgress);
-        assert!(!batch.finalized, ESettlementInProgress);
-
-        if (amount == 0) {
-            return 0
-        };
-
-        assert!(table::contains(&pool.client_balances, client), EInsufficientBalance);
-
-        let balance = table::borrow_mut(&mut pool.client_balances, client);
-
-        // Graceful degradation: take what's available if balance is insufficient
-        let actual_deduct = if (*balance >= amount) { amount } else { *balance };
-        *balance = *balance - actual_deduct;
-
-        // L1: grow this batch's payout budget by what was ACTUALLY debited, so
-        // pay_worker can never pay out more than clients were charged. Saturating
-        // for safety (budget is bounded by the pool in practice).
-        if (batch.budget_remaining <= MAX_U64 - actual_deduct) {
-            batch.budget_remaining = batch.budget_remaining + actual_deduct;
-        } else {
-            batch.budget_remaining = MAX_U64;
-        };
-
-        actual_deduct
     }
 
     /// Pay a worker from the pool, withholding the platform fee.
@@ -705,21 +613,10 @@ module cove::pool_escrow {
 
         assert!(balance::value(&pool.pool) >= gross_amount, EInsufficientPoolBalance);
 
-        // ── L1 protections ──────────────────────────────────────────────────
-        // (1) Per-batch budget: payouts can't exceed what clients were debited
-        //     this cycle (value conservation — a stolen key can't pay workers
-        //     out of clients who weren't charged). Gated on the genesis-off
-        //     switch: only enforced once the orchestrator calls
-        //     `deduct_client_usage` to fund `budget_remaining` (else every
-        //     payout would abort against a 0 budget). The decrement lives inside
-        //     the guard so the counter only moves when it's the source of truth.
-        if (pool.enforce_settlement_budget) {
-            assert!(gross_amount <= batch.budget_remaining, EBatchBudgetExceeded);
-            batch.budget_remaining = batch.budget_remaining - gross_amount;
-        };
-        // (2) Rolling per-window payout cap (when enabled): bounds total COVE
-        //     leaving the pool to workers per window, so a stolen key can't
-        //     drain the whole pool in one window. 0 = disabled.
+        // ── L1 protection: rolling per-window payout cap (when enabled) ──────
+        //     Bounds total COVE leaving the pool to workers per window, so a
+        //     stolen settlement key can't drain the whole pool in one window.
+        //     0 = disabled.
         if (pool.payout_cap > 0) {
             check_and_record_payout(
                 pool.payout_cap,
@@ -825,7 +722,6 @@ module cove::pool_escrow {
             version: _,
             cycle: _,
             started_at: _,
-            budget_remaining: _,
             total_paid: _,
             fees_collected: _,
             workers_paid: _,
@@ -883,7 +779,6 @@ module cove::pool_escrow {
             version: _,
             cycle: _,
             started_at: _,
-            budget_remaining: _,
             total_paid: _,
             fees_collected: _,
             workers_paid: _,
@@ -1041,31 +936,6 @@ module cove::pool_escrow {
         });
     }
 
-    /// Toggle L1 value-conservation enforcement (super-admin). When enabled,
-    /// `pay_worker` requires each gross payout to fit within the cycle's
-    /// `budget_remaining`, which only `deduct_client_usage` grows. Leave OFF
-    /// until the orchestrator debits per client in the settlement PTB — turning
-    /// it on first would abort every payout against a 0 budget. No struct change
-    /// or republish needed to flip this; the mechanism ships in the bytecode.
-    public fun set_budget_enforcement(
-        pool: &mut EscrowPool,
-        admin_reg: &AdminRegistry,
-        enabled: bool,
-        clock: &Clock,
-        ctx: &TxContext
-    ) {
-        assert!(pool.version == VERSION, EWrongVersion);
-        assert!(
-            tx_context::sender(ctx) == admin_registry::super_admin(admin_reg),
-            ENotSuperAdmin
-        );
-        pool.enforce_settlement_budget = enabled;
-
-        event::emit(BudgetEnforcementUpdated {
-            enabled,
-            timestamp: clock::timestamp_ms(clock),
-        });
-    }
 
     // =========================================================================
     // Migration
@@ -1133,10 +1003,6 @@ module cove::pool_escrow {
         pool.platform_fee_bps
     }
 
-    /// Returns whether L1 budget enforcement is active (see set_budget_enforcement).
-    public fun budget_enforcement_enabled(pool: &EscrowPool): bool {
-        pool.enforce_settlement_budget
-    }
 
     /// Returns the current (or most recently completed) settlement cycle number.
     public fun current_cycle(pool: &EscrowPool): u64 {
@@ -1200,11 +1066,6 @@ module cove::pool_escrow {
         batch.finalized
     }
 
-    /// Returns this batch's remaining L1 payout budget (sum of client debits
-    /// not yet paid out to workers this cycle).
-    public fun batch_budget_remaining(batch: &SettlementBatch): u64 {
-        batch.budget_remaining
-    }
 
     // === Test Helpers ===
 
@@ -1219,27 +1080,5 @@ module cove::pool_escrow {
     /// `transfer::transfer` cannot be called from outside this module.
     public fun transfer_batch_for_testing(batch: SettlementBatch, recipient: address) {
         transfer::transfer(batch, recipient)
-    }
-
-    #[test_only]
-    /// Fabricate a standalone SettlementBatch without touching the pool. Lets
-    /// tests exercise the defensive guards (e.g. deduct/pay while the pool
-    /// reports no settlement in progress) that are otherwise unreachable: the
-    /// only production constructor is `start_batch_settlement`, which also flips
-    /// `settlement_in_progress` true, so a live batch normally implies an active
-    /// settlement. Stripped from published bytecode.
-    public fun new_batch_for_testing(cycle: u64, ctx: &mut TxContext): SettlementBatch {
-        SettlementBatch {
-            id: object::new(ctx),
-            version: VERSION,
-            cycle,
-            started_at: 0,
-            budget_remaining: 0,
-            total_paid: 0,
-            fees_collected: 0,
-            workers_paid: 0,
-            finalized: false,
-            config: bag::new(ctx),
-        }
     }
 }

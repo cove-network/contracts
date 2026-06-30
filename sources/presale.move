@@ -21,7 +21,7 @@
 ///
 /// ## Anti-Whale Protection
 ///
-/// Each wallet is limited to purchasing 50M COVE tokens per stage (10% of stage supply).
+/// Each wallet is limited to purchasing 5M COVE tokens per stage (1% of stage supply).
 /// This ensures broad distribution and prevents any single buyer from dominating.
 ///
 /// ## Token Vesting
@@ -64,7 +64,6 @@ module cove::presale {
     const EPresaleNotActive: u64 = 1;
     const EStageNotActive: u64 = 2;
     const EInsufficientPayment: u64 = 3;
-    const EExceedsWalletLimit: u64 = 4;
     const ENoTokensToVest: u64 = 7;
     const EInvalidStage: u64 = 10;
     const EOverflow: u64 = 11;
@@ -112,8 +111,7 @@ module cove::presale {
     /// 500 million COVE tokens per stage (with 9 decimal places).
     const TOKENS_PER_STAGE: u64 = 500_000_000_000_000_000; // 500M * 1e9
 
-    /// Maximum tokens a single wallet can buy in any one stage (50M with 9 decimals).
-    /// This is 10% of the per-stage supply, preventing whale domination.
+    // Maximum tokens a single wallet can buy in any one stage.
     // 2026-06-08 — tightened from 50M to 5M COVE/wallet/stage. At new
     // stage-5 prices this is still a meaningful entry (5M × $0.05 =
     // $250k per wallet at the most expensive stage); aggregate cap

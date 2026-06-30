@@ -75,9 +75,9 @@ upgrade — no struct change, no fresh publish. NOTE: the two ephemeral objects
 bag on consume, so anything written into those must be removed before the object
 is destroyed; the permanent singletons never destroy theirs.
 Likewise, anything that would otherwise need a signature change is added as a
-new `fn_v2` next to the original. Bound-style policy knobs (fees, caps, rep
-curve, vesting durations) are plain mutable fields with admin setters, so they
-retune live without any upgrade at all. **Plan new state to land in the `Bag` or
+new `fn_v2` next to the original. Bound-style policy knobs (platform fee,
+payout cap, tier thresholds, vesting durations) are plain mutable fields with
+admin setters, so they retune live without any upgrade at all. **Plan new state to land in the `Bag` or
 a new function — never by editing a struct.**
 
 ## Performing an Upgrade
